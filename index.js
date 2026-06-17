@@ -12,10 +12,35 @@ const MODEL = process.env.MODEL || 'gpt-4o';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-image';
 const PRODUCT_IMAGE = path.join(__dirname, 'images', 'ceiling-fan-sample.jpg');
+const PLAN_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
 if (!TELEGRAM_TOKEN || !OPENROUTER_API_KEY) {
   console.error('Missing TELEGRAM_TOKEN or OPENROUTER_API_KEY');
   process.exit(1);
+}
+
+// ============================================
+// /plan session state
+// ============================================
+// Map<chatId, { plans: [{number, title, description, direction}], timestamp: Date }>
+const planSessions = new Map();
+
+function getPlanSession(chatId) {
+  const session = planSessions.get(chatId);
+  if (!session) return null;
+  if (Date.now() - session.timestamp > PLAN_SESSION_TTL_MS) {
+    planSessions.delete(chatId);
+    return null;
+  }
+  return session;
+}
+
+function setPlanSession(chatId, plans) {
+  planSessions.set(chatId, { plans, timestamp: Date.now() });
+}
+
+function clearPlanSession(chatId) {
+  planSessions.delete(chatId);
 }
 
 // ============================================
@@ -28,8 +53,10 @@ function buildProductContext() {
 }
 
 // ============================================
-// SYSTEM PROMPT
+// SYSTEM PROMPTS
 // ============================================
+
+// Content execution prompt (existing)
 const SYSTEM_PROMPT = `You are a professional social media marketing copywriter for Fanz Sdn Bhd, a Malaysian fan and air cooler brand.
 
 BRAND VOICE:
@@ -75,10 +102,73 @@ IMPORTANT RULES:
 - Mention on-site service for Malaysia & Singapore customers
 - Reference SIRIM certification naturally
 - Highlight DC motor energy efficiency
-|- DO NOT use overly formal/business language — keep it conversational and warm
-|- DO NOT make up specific discounts/prices unless the user provides them
-|- Mix Chinese and English naturally, like a real Malaysian social media post
-|- Each post should feel unique, not a template`;
+- DO NOT use overly formal/business language — keep it conversational and warm
+- DO NOT make up specific discounts/prices unless the user provides them
+- Mix Chinese and English naturally, like a real Malaysian social media post
+- Each post should feel unique, not a template`;
+
+// Content planning prompt (new — for /plan)
+function buildPlanSystemPrompt() {
+  const now = new Date();
+  const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+  const currentMonth = months[now.getMonth()];
+  const currentYear = now.getFullYear();
+
+  return `You are a senior social media content strategist for Fanz Sdn Bhd, a Malaysian ceiling fan and air cooler brand.
+
+Your job: Suggest 3-5 content topics for the coming week that are relevant, timely, and aligned with the current month in Malaysia.
+
+CURRENT DATE: ${currentMonth} ${currentYear}
+
+MALAYSIA SEASONAL & CULTURAL CONTEXT (use this to guide your suggestions):
+- Hari Raya Aidilfitri (March-April) — home decoration, family gatherings
+- Deepavali (Oct-Nov) — festive lighting, home preparation
+- Chinese New Year (Jan-Feb) — spring cleaning, home upgrades
+- Christmas (Dec) — year-end festive season
+- National Day (Aug 31) — Merdeka campaigns
+- Malaysia Day (Sep 16) — East Malaysia awareness
+- School holidays (March, June, December) — family time at home
+- Rainy season (Nov-Feb) — enclosed spaces, ventilation
+- Hot season (March-May) — peak fan season, heat relief
+- Mid-year sales (June-July) — promotion-friendly period
+- Year-end sales (Nov-Dec) — year-end campaigns
+
+BRAND & PRODUCTS:
+- 10+ years in Malaysia, 10-year motor warranty
+- On-site service across Malaysia & Singapore
+- SIRIM certified, DC motor technology, energy efficient
+- Products: FS Series (smart, large spaces), Grande L (LED light, living/dining), Smart Series (WiFi app control), AURA (compact, bedrooms)
+- We also sell air coolers (pending product expansion details)
+
+YOUR TASK:
+Based on the CURRENT DATE and Malaysia context above, suggest 3-5 content topics for Fanz's social media this week.
+
+For each topic, include:
+1. A catchy title (mixed Chinese-English, like a real Malaysian post)
+2. A one-sentence explanation of why this topic works now
+3. A recommended content direction from exactly one of: product, case, promo, story
+
+Your output MUST follow this exact format — one numbered item per line block with clear separators:
+
+===== 1 =====
+Title: [catchy title]
+Why: [one sentence explaining timeliness/relevance]
+Direction: [product|case|promo|story]
+
+===== 2 =====
+Title: [catchy title]
+Why: [one sentence]
+Direction: [product|case|promo|story]
+
+... and so on up to 5.
+
+IMPORTANT:
+- Do NOT invent holidays or events that don't exist
+- If no major event is near the current date, base suggestions on seasons and general marketing timing
+- Keep suggestions practical for a ceiling fan + air cooler brand
+- Mixed Chinese-English language throughout
+- No post content generation — only topic planning`;
+}
 
 // ============================================
 // OpenRouter API helper (fetch, no SDK)
@@ -164,6 +254,76 @@ async function generateContent(command, userText) {
 }
 
 // ============================================
+// Parse /plan AI response into structured plans
+// ============================================
+function parsePlanResponse(rawText) {
+  const plans = [];
+  let currentPlan = null;
+
+  const lines = rawText.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Detect new plan block: "===== N =====" or "N." at start
+    const blockMatch = trimmed.match(/^=+\s*(\d+)\s*=+/);
+    const numberMatch = trimmed.match(/^(\d+)[.)]\s*$/);
+
+    if (blockMatch) {
+      // Save previous plan if exists
+      if (currentPlan && currentPlan.number) {
+        plans.push(currentPlan);
+      }
+      currentPlan = { number: parseInt(blockMatch[1]), title: '', description: '', direction: '' };
+      continue;
+    }
+
+    if (!currentPlan) {
+      // If we haven't started a block yet, check if line starts with number
+      const startMatch = trimmed.match(/^(\d+)[.)]\s+/);
+      if (startMatch) {
+        if (currentPlan && currentPlan.number) {
+          plans.push(currentPlan);
+        }
+        currentPlan = { number: parseInt(startMatch[1]), title: trimmed.replace(/^\d+[.)]\s*/, ''), description: '', direction: '' };
+        continue;
+      }
+    }
+
+    if (!currentPlan) continue;
+
+    // Parse fields within a plan block
+    const titleMatch = trimmed.match(/^Title:\s*(.+)/i);
+    const whyMatch = trimmed.match(/^Why:\s*(.+)/i);
+    const directionMatch = trimmed.match(/^Direction:\s*(.+)/i);
+
+    if (titleMatch) {
+      currentPlan.title = titleMatch[1].trim();
+    } else if (whyMatch) {
+      currentPlan.description = whyMatch[1].trim();
+    } else if (directionMatch) {
+      const dir = directionMatch[1].trim().toLowerCase();
+      if (['product', 'case', 'promo', 'story'].includes(dir)) {
+        currentPlan.direction = dir;
+      } else {
+        currentPlan.direction = 'product'; // default fallback
+      }
+    } else if (trimmed && !trimmed.startsWith('===') && !trimmed.startsWith('Title') && !trimmed.startsWith('Why') && !trimmed.startsWith('Direction')) {
+      // Free text — could be part of title if title is empty
+      if (!currentPlan.title && trimmed.length > 1) {
+        currentPlan.title = trimmed;
+      }
+    }
+  }
+
+  // Don't forget the last plan
+  if (currentPlan && currentPlan.number && currentPlan.title) {
+    plans.push(currentPlan);
+  }
+
+  return plans;
+}
+
+// ============================================
 // BOT INIT
 // ============================================
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
@@ -182,6 +342,7 @@ bot.onText(/^\/start/, async (msg) => {
 I help you create professional social media content for Fanz Sdn Bhd.
 
 Available commands:
+/plan [context] — AI content planning (suggest topics → pick → generate)
 /product [brief] — Generate product promotion post
 /case [details] — Generate installation case study post
 /promo [details] — Generate promotion / campaign post
@@ -192,6 +353,56 @@ Just type any message without a command, and I'll treat it as a product promotio
 Example: /product Let's promote our new Smart Series fan with WiFi control`;
 
   await bot.sendMessage(chatId, welcome);
+});
+
+// /plan — Content planning workflow
+bot.onText(/^\/plan\b(.*)/is, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const userContext = match[1] ? match[1].trim() : '';
+
+  await bot.sendMessage(chatId, '🧠 Analyzing current date and Malaysia context to plan your week...');
+
+  try {
+    const systemPrompt = buildPlanSystemPrompt();
+    const userPrompt = userContext
+      ? `Generate content plan suggestions. Extra context from user: "${userContext}"`
+      : 'Generate content plan suggestions for this week.';
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ];
+
+    const rawResponse = await callOpenRouter(messages);
+    const plans = parsePlanResponse(rawResponse);
+
+    if (plans.length === 0) {
+      // If parsing failed, show raw response as fallback
+      await bot.sendMessage(chatId, `⚠️ Here's the AI's suggestions (raw):\n\n${rawResponse}\n\nPlease use a command like /product [title] to generate content.`);
+      return;
+    }
+
+    // Store in session
+    setPlanSession(chatId, plans);
+
+    // Build nice output
+    let output = '📋 *This Week\'s Content Plan*\n\n';
+    for (const plan of plans) {
+      const dirEmoji = { product: '🛒', case: '🏠', promo: '🎉', story: '📖' };
+      output += `${dirEmoji[plan.direction] || '📝'} *${plan.number}. ${plan.title}*\n`;
+      output += `   ${plan.description}\n`;
+      output += `   Direction: ${plan.direction}\n\n`;
+    }
+
+    output += '—————————————————\n';
+    output += 'Reply with a *number* (1-' + plans.length + ') to generate that content now!\n';
+    output += 'Or send /plan again for fresh suggestions.';
+
+    await bot.sendMessage(chatId, output, { parse_mode: 'Markdown' });
+  } catch (err) {
+    console.error('/plan error:', err);
+    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+  }
 });
 
 // /product
@@ -250,13 +461,50 @@ bot.onText(/^\/story\b(.*)/is, async (msg, match) => {
   }
 });
 
-// Free text input (not a command) — treated as product promotion brief
+// Free text input
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
 
-  // Skip if it's a command (already handled above) or non-text message
-  if (!text || text.startsWith('/')) return;
+  // Skip non-text messages
+  if (!text) return;
+
+  // === PLAN SELECTION INTERCEPT ===
+  // If user is in a plan session and replied with a number, handle selection
+  if (/^\d+$/.test(text)) {
+    const session = getPlanSession(chatId);
+    if (session) {
+      const num = parseInt(text, 10);
+      const plan = session.plans.find(p => p.number === num);
+
+      if (plan) {
+        // Clear the session so the user doesn't accidentally re-trigger
+        clearPlanSession(chatId);
+
+        await bot.sendMessage(chatId, `⏳ Generating "${plan.title}" (${plan.direction} direction)...`);
+
+        try {
+          const content = await generateContent(plan.direction, plan.title + ' — ' + plan.description);
+          await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
+
+          // Re-prompt: keep the session but the user already selected, so let them know they can /plan again
+          await bot.sendMessage(chatId, `✅ Content generated! Send /plan for new suggestions, or use /${plan.direction} to create another post.`);
+        } catch (err) {
+          console.error('plan selection error:', err);
+          await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again or send /plan to restart.`);
+        }
+        return;
+      } else {
+        // Number out of range
+        const range = session.plans.length;
+        await bot.sendMessage(chatId, `⚠️ Please reply with a number between 1 and ${range}. Or send /plan to start over.`);
+        return;
+      }
+    }
+  }
+
+  // Skip commands (already handled above)
+  if (text.startsWith('/')) return;
 
   await bot.sendMessage(chatId, '⏳ Generating content based on your message...');
   try {
@@ -292,7 +540,7 @@ async function geminiEditImage(prompt) {
   const mimeType = PRODUCT_IMAGE.endsWith('.png') ? 'image/png' : 'image/jpeg';
 
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
