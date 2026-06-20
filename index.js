@@ -225,29 +225,36 @@ IMPORTANT RULES:
 // OpenRouter API helper (fetch, no SDK)
 // ============================================
 async function callOpenRouter(messages) {
-  const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://fanz-marketing-bot.railway.app',
-      'X-Title': 'Fanz Marketing Bot'
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages: messages,
-      max_tokens: 1500,
-      temperature: 0.8
-    })
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://fanz-marketing-bot.railway.app',
+        'X-Title': 'Fanz Marketing Bot'
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: messages,
+        max_tokens: 1500,
+        temperature: 0.8
+      }),
+      signal: controller.signal
+    });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`OpenRouter API error ${response.status}: ${err}`);
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(`OpenRouter API error ${response.status}: ${err}`);
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content;
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const data = await response.json();
-  return data.choices[0].message.content;
 }
 
 // ============================================
@@ -414,7 +421,7 @@ bot.onText(/^\/plan\b(.*)/is, async (msg, match) => {
     await bot.sendMessage(chatId, output, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('/plan error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating plan. Please try /plan again.'));
   }
 });
 
@@ -428,7 +435,7 @@ bot.onText(/^\/product\b(.*)/is, async (msg, match) => {
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('product error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating content. Please try again.'));
   }
 });
 
@@ -442,7 +449,7 @@ bot.onText(/^\/case\b(.*)/is, async (msg, match) => {
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('case error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating case study. Please try again.'));
   }
 });
 
@@ -456,7 +463,7 @@ bot.onText(/^\/promo\b(.*)/is, async (msg, match) => {
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('promo error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating promotion content. Please try again.'));
   }
 });
 
@@ -470,7 +477,7 @@ bot.onText(/^\/story\b(.*)/is, async (msg, match) => {
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('story error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating brand story. Please try again.'));
   }
 });
 
@@ -494,6 +501,9 @@ bot.on('message', async (msg) => {
 
     const { number: num, plan } = validation;
 
+    // Prevent double-click: clear session immediately after extracting plan
+    clearPlanSession(chatId);
+
     // Step 1: Generate content FIRST (fail early — no DB side effects)
     let content;
     try {
@@ -503,7 +513,7 @@ bot.on('message', async (msg) => {
       );
     } catch (err) {
       console.error('plan selection content error:', err);
-      await bot.sendMessage(chatId, `❌ Error generating content: ${err.message}. Please try again.`);
+      await bot.sendMessage(chatId, userMessage(err, 'Failed to generate content. Please try again.'));
       return;
     }
 
@@ -591,7 +601,7 @@ bot.on('message', async (msg) => {
     } catch (err) {
       console.error('review notes save error:', err);
       awaitingReviewNotes.delete(chatId);
-      await bot.sendMessage(chatId, `❌ Could not save revision notes: ${err.message} — please click "Request Changes" again and retry.`);
+      await bot.sendMessage(chatId, userMessage(err, 'Failed to save revision notes. Please try again.'));
     }
     return;
   }
@@ -605,7 +615,7 @@ bot.on('message', async (msg) => {
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
   } catch (err) {
     console.error('freetext error:', err);
-    await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again.`);
+    await bot.sendMessage(chatId, userMessage(err, 'Error generating content. Please try again.'));
   }
 });
 
@@ -711,7 +721,7 @@ bot.onText(/^\/image\b(.*)/is, async (msg, match) => {
     console.error('image error:', err);
     await bot.sendMessage(
       chatId,
-      `❌ Image generation failed: ${err.message}\n\nMake sure:\n1. GEMINI_API_KEY is set\n2. A product image exists at images/ceiling-fan-sample.jpg\n3. The Gemini API key has access to ${GEMINI_MODEL}`
+      userMessage(err, 'Image generation failed. Check your API key and try again.')
     );
   }
 });
@@ -739,7 +749,7 @@ bot.on('callback_query', async (cb) => {
     } catch (err) {
       console.error('approve callback error:', err);
       try {
-        await bot.answerCallbackQuery(cb.id, { text: `Error: ${err.message}` });
+        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' });
       } catch (_) {}
     }
     return;
@@ -759,7 +769,7 @@ bot.on('callback_query', async (cb) => {
     } catch (err) {
       console.error('reject callback error:', err);
       try {
-        await bot.answerCallbackQuery(cb.id, { text: `Error: ${err.message}` });
+        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' });
       } catch (_) {}
     }
     return;
@@ -769,6 +779,11 @@ bot.on('callback_query', async (cb) => {
 // ============================================
 // HELPERS
 // ============================================
+
+function userMessage(err, fallback) {
+  console.error('Operation failed:', err);
+  return `❌ ${fallback || 'An unexpected error occurred. Please try again.'}`;
+}
 
 // Split message if over Telegram's 4096 char limit
 function splitMessage(text, maxLen = 4096) {
@@ -784,6 +799,19 @@ function splitMessage(text, maxLen = 4096) {
 }
 
 async function sendWithSplit(chatId, text, options) {
+  try {
+    await sendWithSplitRaw(chatId, text, options);
+  } catch (err) {
+    if (options && options.parse_mode) {
+      console.warn('Markdown send failed, falling back to plain text:', err.message);
+      await sendWithSplitRaw(chatId, text);
+    } else {
+      throw err;
+    }
+  }
+}
+
+async function sendWithSplitRaw(chatId, text, options) {
   if (text.length <= 4096) {
     await bot.sendMessage(chatId, text, options);
   } else {
@@ -823,4 +851,6 @@ module.exports = {
   awaitingReviewNotes,
   planSessions,
   PILLAR_EMOJI,
+  sendWithSplit,
+  sendWithSplitRaw,
 };
