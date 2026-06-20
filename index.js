@@ -60,9 +60,14 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-image';
 const PRODUCT_IMAGE = path.join(__dirname, 'images', 'ceiling-fan-sample.jpg');
 const PLAN_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
+// Test hook: skip live bot + HTTP startup so the module is requireable from tests.
+const SKIP_BOT_INIT = process.env.SKIP_BOT_INIT === '1';
+
 if (!TELEGRAM_TOKEN || !OPENROUTER_API_KEY) {
-  console.error('Missing TELEGRAM_TOKEN or OPENROUTER_API_KEY');
-  process.exit(1);
+  if (!SKIP_BOT_INIT) {
+    console.error('Missing TELEGRAM_TOKEN or OPENROUTER_API_KEY');
+    process.exit(1);
+  }
 }
 
 if (supabase.isConfigured()) {
@@ -80,6 +85,10 @@ if (supabase.isConfigured()) {
 // Map<chatId, { plans: [{number, title, description, direction}], timestamp: Date }>
 const planSessions = new Map();
 
+// Map<chatId, { rowId, reviewMsgId }> — set when user clicks "Request Changes",
+// cleared after their next text message is consumed as the revision note.
+const awaitingReviewNotes = new Map();
+
 function getPlanSession(chatId) {
   const session = planSessions.get(chatId);
   if (!session) return null;
@@ -96,6 +105,56 @@ function setPlanSession(chatId, plans) {
 
 function clearPlanSession(chatId) {
   planSessions.delete(chatId);
+}
+
+// ============================================
+// Review node helpers
+// ============================================
+const PILLAR_EMOJI = { product: '🛒', case: '🏠', promo: '🎉', story: '📖' };
+
+function buildReviewMessage(parsed, plan) {
+  const emoji = PILLAR_EMOJI[plan.direction] || '📝';
+  return (
+    `🔎 *Review Required*\n\n` +
+    `${emoji} *${plan.title}*\n` +
+    `Direction: ${plan.direction}\n\n` +
+    `📱 *Facebook*\n${parsed.fb_content}\n\n` +
+    `📸 *Instagram*\n${parsed.ig_content}\n\n` +
+    `#⃣ *Hashtags*\n${parsed.hashtags}`
+  );
+}
+
+function buildReviewKeyboard(rowId) {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve', callback_data: `review_approve:${rowId}` },
+        { text: '✏️ Request Changes', callback_data: `review_reject:${rowId}` },
+      ],
+    ],
+  };
+}
+
+function buildApprovePayload() {
+  return { status: 'approved' };
+}
+
+function buildRejectPayload(notes) {
+  return { status: 'rejected', review_notes: notes };
+}
+
+// Pure priority decider so tests can lock in the message-handler intercept order.
+//   non-text          → 'skip'
+//   digit + plan      → 'plan_selection'
+//   awaiting review   → 'review_notes'
+//   starts with /     → 'command'
+//   otherwise         → 'free_text'
+function decideMessageIntent(text, hasPlanSession, hasAwaitingReview) {
+  if (typeof text !== 'string' || text.length === 0) return 'skip';
+  if (/^[1-9]\d{0,2}$/.test(text) && hasPlanSession) return 'plan_selection';
+  if (hasAwaitingReview) return 'review_notes';
+  if (text.startsWith('/')) return 'command';
+  return 'free_text';
 }
 
 // ============================================
@@ -248,9 +307,15 @@ async function generateContent(command, userText) {
 // ============================================
 // BOT INIT
 // ============================================
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// Under SKIP_BOT_INIT, use a no-op proxy so registering handlers and dispatching
+// methods is a silent no-op — tests can require the module without polling.
+const bot = SKIP_BOT_INIT
+  ? new Proxy({}, { get: () => () => Promise.resolve() })
+  : new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-console.log(`Fanz Marketing Bot started. Model: ${MODEL}. Commit: ${COMMIT_SHA}`);
+if (!SKIP_BOT_INIT) {
+  console.log(`Fanz Marketing Bot started. Model: ${MODEL}. Commit: ${COMMIT_SHA}`);
+}
 
 // ============================================
 // HTTP SERVER (Railway health + version probe)
@@ -272,9 +337,11 @@ const httpServer = http.createServer((req, res) => {
   res.end('Not Found');
 });
 
-httpServer.listen(HTTP_PORT, () => {
-  console.log(`HTTP server listening on :${HTTP_PORT} (commit=${COMMIT_SHA})`);
-});
+if (!SKIP_BOT_INIT) {
+  httpServer.listen(HTTP_PORT, () => {
+    console.log(`HTTP server listening on :${HTTP_PORT} (commit=${COMMIT_SHA})`);
+  });
+}
 
 // ============================================
 // COMMANDS
@@ -475,6 +542,21 @@ bot.on('message', async (msg) => {
               hashtags: parsed.hashtags,
               status: 'copy_done',
             });
+
+            // Step 2c: Review node — transition copy_done → pending_review and
+            // post the review card with inline Approve / Request Changes buttons.
+            // Send review card FIRST, then update status. If sendMessage fails,
+            // row stays at copy_done — no orphaned pending_review row.
+            try {
+              const reviewMsg = buildReviewMessage(parsed, plan);
+              await bot.sendMessage(chatId, reviewMsg, {
+                parse_mode: 'Markdown',
+                reply_markup: buildReviewKeyboard(createdRow.id),
+              });
+              await supabase.updateContentCalendar(createdRow.id, { status: 'pending_review' });
+            } catch (err) {
+              console.error('review card send error:', err);
+            }
           } else {
             console.warn(`copywriting validation failed (${validation.errors.join('; ')}) — falling back to generateContent only`);
           }
@@ -490,6 +572,27 @@ bot.on('message', async (msg) => {
 
     await bot.sendMessage(chatId, `✅ Selected: ${plan.title} (${plan.direction} direction)`);
     await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // === REVIEW NOTES INTERCEPT ===
+  // Runs after plan-selection so a stray digit reply still routes to plan selection
+  // when both modes are active; runs before the / skip so a "/foo" typed as a note
+  // is captured rather than swallowed as a command.
+  if (awaitingReviewNotes.has(chatId)) {
+    const { rowId } = awaitingReviewNotes.get(chatId);
+    try {
+      await supabase.updateContentCalendar(rowId, buildRejectPayload(text));
+      awaitingReviewNotes.delete(chatId);
+      await bot.sendMessage(
+        chatId,
+        '✏️ Revision notes saved. The content has been moved back for revision.'
+      );
+    } catch (err) {
+      console.error('review notes save error:', err);
+      awaitingReviewNotes.delete(chatId);
+      await bot.sendMessage(chatId, `❌ Could not save revision notes: ${err.message} — please click "Request Changes" again and retry.`);
+    }
     return;
   }
 
@@ -614,6 +717,56 @@ bot.onText(/^\/image\b(.*)/is, async (msg, match) => {
 });
 
 // ============================================
+// REVIEW CALLBACK HANDLER
+// ============================================
+bot.on('callback_query', async (cb) => {
+  const data = (cb && cb.data) || '';
+  const message = cb && cb.message;
+  const chatId = message && message.chat && message.chat.id;
+  const messageId = message && message.message_id;
+
+  if (data.startsWith('review_approve:')) {
+    const rowId = data.slice('review_approve:'.length);
+    try {
+      await supabase.updateContentCalendar(rowId, buildApprovePayload());
+      await bot.answerCallbackQuery(cb.id, { text: 'Approved ✓' });
+      const originalText = (message && message.text) || '';
+      await bot.editMessageText(originalText + '\n\n✅ Approved', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      });
+    } catch (err) {
+      console.error('approve callback error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: `Error: ${err.message}` });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  if (data.startsWith('review_reject:')) {
+    const rowId = data.slice('review_reject:'.length);
+    try {
+      const originalText = (message && message.text) || '';
+      await bot.editMessageText(originalText + '\n\n✏️ Please send your revision notes below:', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      });
+      awaitingReviewNotes.set(chatId, { rowId, reviewMsgId: messageId });
+      await bot.answerCallbackQuery(cb.id, { text: 'Please send revision notes' });
+    } catch (err) {
+      console.error('reject callback error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: `Error: ${err.message}` });
+      } catch (_) {}
+    }
+    return;
+  }
+});
+
+// ============================================
 // HELPERS
 // ============================================
 
@@ -657,3 +810,17 @@ process.on('SIGTERM', () => {
   httpServer.close();
   process.exit(0);
 });
+
+// ============================================
+// EXPORTS (for tests)
+// ============================================
+module.exports = {
+  buildReviewMessage,
+  buildReviewKeyboard,
+  buildApprovePayload,
+  buildRejectPayload,
+  decideMessageIntent,
+  awaitingReviewNotes,
+  planSessions,
+  PILLAR_EMOJI,
+};
