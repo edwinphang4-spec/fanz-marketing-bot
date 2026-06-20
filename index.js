@@ -5,6 +5,7 @@ const path = require('path');
 const http = require('http');
 const supabase = require('./lib/supabase');
 const { buildPlanSystemPrompt, parsePlanResponse, validateSelection, createSelectionPayload } = require('./lib/planning');
+const { buildCopywritingPrompt, parseCopywritingResponse, validateCopywritingResult } = require('./lib/copywriting');
 
 // ============================================
 // VERSION / GIT COMMIT SHA
@@ -440,9 +441,10 @@ bot.on('message', async (msg) => {
     }
 
     // Step 2: Persist the selection to content_calendar
+    let createdRow = null;
     if (supabase.isConfigured()) {
       try {
-        await supabase.createContentCalendar(createSelectionPayload(plan, chatId));
+        createdRow = await supabase.createContentCalendar(createSelectionPayload(plan, chatId));
       } catch (err) {
         console.error('createContentCalendar error:', err);
         // Don't block content delivery — user already has the content
@@ -450,6 +452,37 @@ bot.on('message', async (msg) => {
       }
     } else {
       console.warn('Supabase not configured — skipping content_calendar write for plan selection');
+    }
+
+    // Step 2b: Copywriting pipeline — generate FB/IG/hashtags and persist to the row.
+    // Falls through silently on failure; the user still receives the generateContent output.
+    if (createdRow && createdRow.id) {
+      try {
+        const copywritingPrompt = buildCopywritingPrompt(plan.title, plan.direction);
+        const copyRaw = await callOpenRouter([
+          { role: 'system', content: copywritingPrompt },
+          { role: 'user', content: `Generate social media content for this Fanz topic.` },
+        ]);
+        const parsed = parseCopywritingResponse(copyRaw);
+        if (!parsed) {
+          console.warn('copywriting parse returned null — falling back to generateContent only');
+        } else {
+          const validation = validateCopywritingResult(parsed);
+          if (validation.valid) {
+            await supabase.updateContentCalendar(createdRow.id, {
+              fb_content: parsed.fb_content,
+              ig_content: parsed.ig_content,
+              hashtags: parsed.hashtags,
+              status: 'copy_done',
+            });
+          } else {
+            console.warn(`copywriting validation failed (${validation.errors.join('; ')}) — falling back to generateContent only`);
+          }
+        }
+      } catch (err) {
+        console.error('copywriting pipeline error:', err);
+        // Fall back silently — generateContent output still delivered below
+      }
     }
 
     // Step 3: Clear session (idempotent — repeat same number = session expired)
