@@ -128,7 +128,7 @@ assertDoesNotThrow(() => sm.transition('rejected', 'copy_done'), 'rejected → c
 console.log('\n--- illegal transitions ---');
 assertThrows(() => sm.transition('draft', 'published'), 'draft → published illegal');
 assertThrows(() => sm.transition('draft', 'approved'), 'draft → approved illegal (no skipping)');
-assertThrows(() => sm.transition('draft', 'selected'), 'draft → selected illegal (no skipping)');
+assertDoesNotThrow(() => sm.transition('draft', 'selected'), 'draft → selected legal (direct selection)');
 assertThrows(() => sm.transition('planning_done', 'approved'), 'planning_done → approved illegal');
 assertThrows(() => sm.transition('selected', 'published'), 'selected → published illegal');
 assertThrows(() => sm.transition('copy_done', 'approved'), 'copy_done → approved illegal (review required)');
@@ -165,7 +165,7 @@ function sameSet(a, b) {
 }
 
 const expected = {
-  draft: ['planning_done'],
+  draft: ['planning_done', 'selected'],
   planning_done: ['selected'],
   selected: ['copy_done'],
   copy_done: ['pending_review'],

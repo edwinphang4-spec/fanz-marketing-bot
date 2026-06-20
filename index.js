@@ -415,37 +415,61 @@ bot.on('message', async (msg) => {
   if (!text) return;
 
   // === PLAN SELECTION INTERCEPT ===
-  // If user is in a plan session and replied with a number, handle selection
+  // A bare-number reply is interpreted as a plan selection.
+  // Non-numbers fall through to regular message handling below.
   if (/^\d+$/.test(text)) {
     const session = getPlanSession(chatId);
-    if (session) {
-      const num = parseInt(text, 10);
-      const plan = session.plans.find(p => p.number === num);
+    if (!session) {
+      await bot.sendMessage(chatId, 'Session expired or not found. Please send /plan to start over.');
+      return;
+    }
 
-      if (plan) {
-        // Clear the session so the user doesn't accidentally re-trigger
-        clearPlanSession(chatId);
+    const num = parseInt(text, 10);
+    const plan = session.plans.find(p => p.number === num);
 
-        await bot.sendMessage(chatId, `⏳ Generating "${plan.title}" (${plan.direction} direction)...`);
+    if (!plan) {
+      await bot.sendMessage(
+        chatId,
+        `Please reply with a number between 1-${session.plans.length}. Or send /plan to start over.`
+      );
+      return;
+    }
 
-        try {
-          const content = await generateContent(plan.direction, plan.title + ' — ' + plan.description);
-          await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
-
-          // Re-prompt: keep the session but the user already selected, so let them know they can /plan again
-          await bot.sendMessage(chatId, `✅ Content generated! Send /plan for new suggestions, or use /${plan.direction} to create another post.`);
-        } catch (err) {
-          console.error('plan selection error:', err);
-          await bot.sendMessage(chatId, `❌ Error: ${err.message}. Please try again or send /plan to restart.`);
-        }
-        return;
-      } else {
-        // Number out of range
-        const range = session.plans.length;
-        await bot.sendMessage(chatId, `⚠️ Please reply with a number between 1 and ${range}. Or send /plan to start over.`);
+    // Persist the selection to content_calendar. On failure, keep the session so the user can retry.
+    if (supabase.isConfigured()) {
+      try {
+        await supabase.createContentCalendar({
+          chat_id: String(chatId),
+          pillar: plan.direction,
+          topic: plan.title,
+          status: 'selected',
+        });
+      } catch (err) {
+        console.error('createContentCalendar error:', err);
+        await bot.sendMessage(
+          chatId,
+          `❌ Could not save selection: ${err.message}. Please try again.`
+        );
         return;
       }
+    } else {
+      console.warn('Supabase not configured — skipping content_calendar write for plan selection');
     }
+
+    // Clear session so a repeat of the same number falls into the "session expired" path (idempotent).
+    clearPlanSession(chatId);
+
+    await bot.sendMessage(chatId, `✅ Selected: ${plan.title} (${plan.direction} direction)`);
+    await bot.sendMessage(chatId, 'Now generating content for this topic...');
+
+    try {
+      const content = await generateContent(plan.direction, plan.title + ' — ' + plan.description);
+      await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error('plan selection content error:', err);
+      await bot.sendMessage(chatId, `❌ Error generating content: ${err.message}. Please try again.`);
+    }
+    return;
   }
 
   // Skip commands (already handled above)
