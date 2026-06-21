@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <rect width="400" height="400" fill="#ffffff"/>
+  <rect x="140" y="120" width="120" height="180" rx="10" fill="#e0e0e0" stroke="#bbb" stroke-width="2"/>
+  <rect x="160" y="140" width="80" height="80" rx="5" fill="#d0d0d0"/>
+  <line x1="180" y1="160" x2="220" y2="160" stroke="#aaa" stroke-width="2"/>
+  <line x1="180" y1="180" x2="220" y2="180" stroke="#aaa" stroke-width="2"/>
+  <line x1="180" y1="200" x2="220" y2="200" stroke="#aaa" stroke-width="2"/>
+  <rect x="185" y="240" width="30" height="50" rx="3" fill="#ccc"/>
+  <circle cx="200" cy="120" r="5" fill="#999"/>
+  <circle cx="180" cy="120" r="3" fill="#999"/>
+  <circle cx="220" cy="120" r="3" fill="#999"/>
+  <text x="200" y="380" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#999">Portable Air Cooler</text>
+</svg>

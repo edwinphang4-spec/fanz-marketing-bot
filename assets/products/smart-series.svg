@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <rect width="400" height="400" fill="#ffffff"/>
+  <circle cx="200" cy="200" r="15" fill="#555"/>
+  <line x1="200" y1="200" x2="110" y2="135" stroke="#777" stroke-width="7" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="290" y2="135" stroke="#777" stroke-width="7" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="110" y2="265" stroke="#777" stroke-width="7" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="290" y2="265" stroke="#777" stroke-width="7" stroke-linecap="round"/>
+  <line x1="200" y1="170" x2="200" y2="50" stroke="#bbb" stroke-width="4"/>
+  <circle cx="200" cy="30" r="8" fill="#4a90d9"/>
+  <text x="200" y="380" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#999">Smart Series WiFi</text>
+</svg>

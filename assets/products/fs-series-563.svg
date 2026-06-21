@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <rect width="400" height="400" fill="#ffffff"/>
+  <circle cx="200" cy="200" r="15" fill="#888"/>
+  <line x1="200" y1="200" x2="120" y2="140" stroke="#aaa" stroke-width="6" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="280" y2="140" stroke="#aaa" stroke-width="6" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="120" y2="260" stroke="#aaa" stroke-width="6" stroke-linecap="round"/>
+  <line x1="200" y1="200" x2="280" y2="260" stroke="#aaa" stroke-width="6" stroke-linecap="round"/>
+  <line x1="200" y1="175" x2="200" y2="50" stroke="#bbb" stroke-width="4"/>
+  <rect x="190" y="25" width="20" height="30" rx="3" fill="#ccc"/>
+  <text x="200" y="380" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#999">FS Series 563 L</text>
+</svg>
