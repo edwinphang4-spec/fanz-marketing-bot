@@ -566,32 +566,6 @@ bot.on('message', async (msg) => {
                 reply_markup: buildReviewKeyboard(createdRow.id),
               });
               await supabase.updateContentCalendar(createdRow.id, { status: 'pending_review' });
-
-              // Step 2d: Imagery pipeline — 场景图生成 [I-2]
-              // Fire-and-forget: 不阻断用户，后台执行场景图生成。
-              // source_product_image 已在 [I-1] 写入，pillar/topic 由 plan 提供。
-              if (supabase.isConfigured()) {
-                const { selectProductImage } = require('./lib/select-product');
-                const sourceImage = createdRow.source_product_image || null;
-                const productsDir = require('./lib/select-product').PRODUCTS_DIR;
-                generateSceneImage(
-                  createdRow.id,
-                  plan.title,
-                  plan.direction,
-                  sourceImage,
-                  productsDir
-                ).then(result => {
-                  if (result.dryRun) {
-                    console.log(`scene-gen: dry-run for row ${createdRow.id} — ${result.sceneImageUrl}`);
-                  } else if (result.success) {
-                    console.log(`scene-gen: success for row ${createdRow.id} — image=${result.sceneImageUrl}`);
-                  } else {
-                    console.error(`scene-gen: failed for row ${createdRow.id} — ${result.error}`);
-                  }
-                }).catch(err => {
-                  console.error(`scene-gen: uncaught error for row ${createdRow.id}:`, err.message);
-                });
-              }
             } catch (err) {
               console.error('review card send error:', err);
             }
@@ -774,18 +748,59 @@ bot.on('callback_query', async (cb) => {
   if (data.startsWith('review_approve:')) {
     const rowId = data.slice('review_approve:'.length);
     try {
-      await supabase.updateContentCalendar(rowId, buildApprovePayload());
-      await bot.answerCallbackQuery(cb.id, { text: 'Approved ✓' });
+      // Step 2d: Copy approved → copy_approved (not 'approved' anymore — imagery phase follows)
+      await supabase.updateContentCalendar(rowId, { status: 'copy_approved' });
+      await bot.answerCallbackQuery(cb.id, { text: '✅ Copy approved — generating imagery...' });
       const originalText = (message && message.text) || '';
-      await bot.editMessageText(originalText + '\n\n✅ Approved', {
+      await bot.editMessageText(originalText + '\n\n✅ Copy Approved\n⏳ Generating imagery...', {
         chat_id: chatId,
         message_id: messageId,
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
-          ],
-        },
+        reply_markup: { inline_keyboard: [] },
       });
+
+      // Trigger imagery pipeline (I-1 → I-2 → I-3 → I-4) as fire-and-forget
+      if (supabase.isConfigured()) {
+        const { selectProductImage } = require('./lib/select-product');
+        const { generateSceneImage } = require('./lib/scene-gen');
+        const productsDir = require('./lib/select-product').PRODUCTS_DIR;
+
+        // Read current row to get topic/pillar
+        const row = await supabase.getContentCalendar(rowId);
+        if (row) {
+          const sourceImage = row.source_product_image || null;
+
+          generateSceneImage(
+            rowId,
+            row.topic || '',
+            row.pillar || 'product',
+            sourceImage,
+            productsDir
+          ).then(async (result) => {
+            if (result.success) {
+              if (result.idempotent) {
+                // Already had imagery — send image review card directly
+                const sceneUrl = result.sceneImageUrl || row.scene_image_url || '(placeholder)';
+                await sendImageReviewCard(chatId, rowId, sceneUrl, result.imageStatus);
+              } else if (result.dryRun) {
+                console.log(`scene-gen: dry-run for row ${rowId} — ${result.sceneImageUrl}`);
+                await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
+                await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(dry-run)', 'generated', true);
+              } else {
+                console.log(`scene-gen: success for row ${rowId} — image=${result.sceneImageUrl}`);
+                await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
+                await sendImageReviewCard(chatId, rowId, result.sceneImageUrl, 'generated');
+              }
+            } else {
+              // Technical failure — stay at copy_approved, notify user
+              console.error(`scene-gen: failed for row ${rowId} — ${result.error}`);
+              await sendTechnicalFailureNotice(chatId, rowId, result.error);
+            }
+          }).catch(async (err) => {
+            console.error(`scene-gen: uncaught error for row ${rowId}:`, err.message);
+            await sendTechnicalFailureNotice(chatId, rowId, err.message);
+          });
+        }
+      }
     } catch (err) {
       console.error('approve callback error:', err);
       try {
@@ -853,6 +868,131 @@ bot.on('callback_query', async (cb) => {
       console.error('publish callback error:', err);
       try {
         await bot.answerCallbackQuery(cb.id, { text: 'Publish failed. Please try again.' });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  // ============================================
+  // IMAGE REVIEW CALLBACKS — 配图审核 [I-2 两步审]
+  // ============================================
+
+  // image_approve:rowId — approve imagery, move to 'approved' (all gates passed)
+  if (data.startsWith('image_approve:')) {
+    const rowId = data.slice('image_approve:'.length);
+    try {
+      await supabase.updateContentCalendar(rowId, { status: 'approved' });
+      await bot.answerCallbackQuery(cb.id, { text: '✅ Image approved — ready to publish!' });
+      const originalText = (message && message.text) || '';
+      await bot.editMessageText(originalText + '\n\n✅ Image Approved\n🚀 Ready to publish!', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error('image_approve callback error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  // image_reject:rowId:count — reject imagery, move to image_retry for regeneration
+  if (data.startsWith('image_reject:')) {
+    const parts = data.split(':');
+    const rowId = parts[1];
+    const currentCount = parseInt(parts[2] || '0', 10);
+    const nextCount = currentCount + 1;
+
+    try {
+      if (nextCount >= 3) {
+        // Max retries reached — show skip button alongside retry
+        await supabase.updateContentCalendar(rowId, { status: 'image_retry' });
+        await bot.answerCallbackQuery(cb.id, { text: `Rejected (${nextCount}/3). Image can be regenerated or skipped.` });
+        const originalText = (message && message.text) || '';
+        await bot.editMessageText(originalText + `\n\n✏️ Image Rejected (${nextCount}/3)\n🔄 Regenerate or ⏭️ Skip image to publish copy-only`, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '🔄 Regenerate', callback_data: `image_retry_go:${rowId}:${nextCount}` },
+                { text: '⏭️ Skip Image', callback_data: `image_skip:${rowId}` },
+              ],
+            ],
+          },
+        });
+      } else {
+        // Under retry limit — auto-regenerate
+        await supabase.updateContentCalendar(rowId, { status: 'image_retry' });
+        await bot.answerCallbackQuery(cb.id, { text: `Rejected (${nextCount}/3). Regenerating...` });
+        const originalText = (message && message.text) || '';
+        await bot.editMessageText(originalText + `\n\n✏️ Image Rejected (${nextCount}/3)\n⏳ Regenerating...`, {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: [] },
+        });
+
+        // Trigger re-generation
+        triggerImageRegeneration(rowId, chatId);
+      }
+    } catch (err) {
+      console.error('image_reject callback error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  // image_retry_go:rowId:count — manual retry of image generation
+  if (data.startsWith('image_retry_go:')) {
+    const parts = data.split(':');
+    const rowId = parts[1];
+    const count = parseInt(parts[2] || '0', 10);
+    try {
+      await bot.answerCallbackQuery(cb.id, { text: 'Regenerating image...' });
+      const originalText = (message && message.text) || '';
+      await bot.editMessageText(originalText + '\n\n⏳ Regenerating image...', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      });
+      triggerImageRegeneration(rowId, chatId, count);
+    } catch (err) {
+      console.error('image_retry_go error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: 'Failed. Please try again.' });
+      } catch (_) {}
+    }
+    return;
+  }
+
+  // image_skip:rowId — skip imagery entirely, publish copy-only
+  if (data.startsWith('image_skip:')) {
+    const rowId = data.slice('image_skip:'.length);
+    try {
+      await supabase.updateContentCalendar(rowId, { status: 'approved' });
+      await bot.answerCallbackQuery(cb.id, { text: 'Image skipped. Ready to publish copy-only!' });
+      const originalText = (message && message.text) || '';
+      await bot.editMessageText(originalText + '\n\n⏭️ Image Skipped\n📝 Publishing copy-only\n🚀 Ready to publish!', {
+        chat_id: chatId,
+        message_id: messageId,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
+          ],
+        },
+      });
+    } catch (err) {
+      console.error('image_skip callback error:', err);
+      try {
+        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' });
       } catch (_) {}
     }
     return;
@@ -971,6 +1111,96 @@ async function sendWithSplitRaw(chatId, text, options) {
     for (const chunk of chunks) {
       await bot.sendMessage(chatId, chunk, options);
     }
+  }
+}
+
+// ============================================
+// IMAGE REVIEW HELPERS — 配图审核卡 + 技术失败通知 + 重生成
+// ============================================
+
+/**
+ * Send imagery review card for user to approve/reject the generated scene image.
+ */
+async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRun) {
+  const dryRunLabel = isDryRun ? ' (dry-run)' : '';
+  const message = `🖼️ *Image Review Required${dryRunLabel}*\n\nScene image generated: \`${sceneImageUrl}\`\nStatus: ${status}\n\nIs this image suitable for the post?`;
+
+  await bot.sendMessage(chatId, message, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '✅ Approve Image', callback_data: `image_approve:${rowId}` },
+          { text: '✏️ Regenerate', callback_data: `image_reject:${rowId}:0` },
+        ],
+      ],
+    },
+  });
+}
+
+/**
+ * Send technical failure notice when imagery pipeline fails.
+ * User can retry or skip imagery.
+ */
+async function sendTechnicalFailureNotice(chatId, rowId, errorMsg) {
+  const message = `⚠️ *Image Generation Failed*\n\nTechnical error: ${errorMsg.slice(0, 200)}\n\nYou can retry or skip imagery and publish copy-only.`;
+
+  await bot.sendMessage(chatId, message, {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '🔄 Retry', callback_data: `image_retry_go:${rowId}:0` },
+          { text: '⏭️ Skip Image', callback_data: `image_skip:${rowId}` },
+        ],
+      ],
+    },
+  });
+}
+
+/**
+ * Trigger image regeneration when user rejects or retries.
+ * Resets image_status and re-runs scene-gen pipeline.
+ */
+async function triggerImageRegeneration(rowId, chatId, count) {
+  try {
+    const supabase = require('./lib/supabase');
+    const { resetImageStatus } = require('./lib/image-state');
+    const { generateSceneImage } = require('./lib/scene-gen');
+    const { selectProductImage } = require('./lib/select-product');
+    const productsDir = require('./lib/select-product').PRODUCTS_DIR;
+
+    // Reset image_status to 'generating'
+    await resetImageStatus(rowId);
+
+    // Read row for topic/pillar
+    const row = await supabase.getContentCalendar(rowId);
+    if (!row) {
+      await bot.sendMessage(chatId, '❌ Row not found.');
+      return;
+    }
+
+    const result = await generateSceneImage(
+      rowId,
+      row.topic || '',
+      row.pillar || 'product',
+      row.source_product_image || null,
+      productsDir
+    );
+
+    if (result.success) {
+      await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
+      const retryLabel = count ? ` (retry #${count})` : '';
+      await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(scene)', 'generated' + retryLabel, result.dryRun);
+    } else {
+      // Still failed
+      await sendTechnicalFailureNotice(chatId, rowId, result.error);
+    }
+  } catch (err) {
+    console.error('triggerImageRegeneration error:', err);
+    try {
+      await bot.sendMessage(chatId, `❌ ${'Failed to regenerate image. Please try again.'}`);
+    } catch (_) {}
   }
 }
 
