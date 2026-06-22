@@ -793,11 +793,11 @@ bot.on('callback_query', async (cb) => {
             } else {
               // Technical failure — stay at copy_approved, notify user
               console.error(`scene-gen: failed for row ${rowId} — ${result.error}`);
-              await sendTechnicalFailureNotice(chatId, rowId, result.error);
+              await sendTechnicalFailureNotice(chatId, rowId);
             }
           }).catch(async (err) => {
             console.error(`scene-gen: uncaught error for row ${rowId}:`, err.message);
-            await sendTechnicalFailureNotice(chatId, rowId, err.message);
+            await sendTechnicalFailureNotice(chatId, rowId);
           });
         }
       }
@@ -939,7 +939,7 @@ bot.on('callback_query', async (cb) => {
         });
 
         // Trigger re-generation
-        triggerImageRegeneration(rowId, chatId);
+        triggerImageRegeneration(rowId, chatId, nextCount);
       }
     } catch (err) {
       console.error('image_reject callback error:', err);
@@ -1120,9 +1120,11 @@ async function sendWithSplitRaw(chatId, text, options) {
 
 /**
  * Send imagery review card for user to approve/reject the generated scene image.
+ * @param {number} [retryCount] - optional retry count for callback_data, default 0
  */
-async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRun) {
+async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRun, retryCount) {
   const dryRunLabel = isDryRun ? ' (dry-run)' : '';
+  const count = typeof retryCount === 'number' ? retryCount : 0;
   const message = `🖼️ *Image Review Required${dryRunLabel}*\n\nScene image generated: \`${sceneImageUrl}\`\nStatus: ${status}\n\nIs this image suitable for the post?`;
 
   await bot.sendMessage(chatId, message, {
@@ -1131,7 +1133,7 @@ async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRu
       inline_keyboard: [
         [
           { text: '✅ Approve Image', callback_data: `image_approve:${rowId}` },
-          { text: '✏️ Regenerate', callback_data: `image_reject:${rowId}:0` },
+          { text: '✏️ Regenerate', callback_data: `image_reject:${rowId}:${count}` },
         ],
       ],
     },
@@ -1142,8 +1144,8 @@ async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRu
  * Send technical failure notice when imagery pipeline fails.
  * User can retry or skip imagery.
  */
-async function sendTechnicalFailureNotice(chatId, rowId, errorMsg) {
-  const message = `⚠️ *Image Generation Failed*\n\nTechnical error: ${errorMsg.slice(0, 200)}\n\nYou can retry or skip imagery and publish copy-only.`;
+async function sendTechnicalFailureNotice(chatId, rowId) {
+  const message = `⚠️ *Image Generation Failed*\n\nA technical error occurred while generating the scene image.\n\nYou can retry or skip imagery and publish copy-only.`;
 
   await bot.sendMessage(chatId, message, {
     parse_mode: 'Markdown',
@@ -1191,10 +1193,10 @@ async function triggerImageRegeneration(rowId, chatId, count) {
     if (result.success) {
       await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
       const retryLabel = count ? ` (retry #${count})` : '';
-      await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(scene)', 'generated' + retryLabel, result.dryRun);
+      await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(scene)', 'generated' + retryLabel, result.dryRun, count);
     } else {
       // Still failed
-      await sendTechnicalFailureNotice(chatId, rowId, result.error);
+      await sendTechnicalFailureNotice(chatId, rowId);
     }
   } catch (err) {
     console.error('triggerImageRegeneration error:', err);
