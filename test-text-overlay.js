@@ -222,7 +222,7 @@ try {
 } catch (e) { fail(e.message); }
 
 // ──────────────────────────────────────────
-// 15. extractTextsFromRow: 正确映射
+// 17. extractTextsFromRow: 正确映射
 // ──────────────────────────────────────────
 console.log('Test 17: extractTextsFromRow mapping');
 try {
@@ -245,9 +245,9 @@ try {
 } catch (e) { fail(e.message); }
 
 // ──────────────────────────────────────────
-// 16. extractTextsFromRow: 空行安全
+// 18. extractTextsFromRow: 空行安全
 // ──────────────────────────────────────────
-console.log('Test 16: extractTextsFromRow — sparse row');
+console.log('Test 18: extractTextsFromRow — sparse row');
 try {
   const texts = to.extractTextsFromRow({ topic: 'only title' });
   assert.strictEqual(texts.title, 'only title');
