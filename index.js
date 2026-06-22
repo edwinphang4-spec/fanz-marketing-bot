@@ -7,6 +7,7 @@ const supabase = require('./lib/supabase');
 const { buildPlanSystemPrompt, parsePlanResponse, validateSelection, createSelectionPayload } = require('./lib/planning');
 const { buildCopywritingPrompt, parseCopywritingResponse, validateCopywritingResult } = require('./lib/copywriting');
 const { publishToSocial } = require('./lib/publish');
+const { generateSceneImage } = require('./lib/scene-gen');
 
 // ============================================
 // VERSION / GIT COMMIT SHA
@@ -565,6 +566,32 @@ bot.on('message', async (msg) => {
                 reply_markup: buildReviewKeyboard(createdRow.id),
               });
               await supabase.updateContentCalendar(createdRow.id, { status: 'pending_review' });
+
+              // Step 2d: Imagery pipeline — 场景图生成 [I-2]
+              // Fire-and-forget: 不阻断用户，后台执行场景图生成。
+              // source_product_image 已在 [I-1] 写入，pillar/topic 由 plan 提供。
+              if (supabase.isConfigured()) {
+                const { selectProductImage } = require('./lib/select-product');
+                const sourceImage = createdRow.source_product_image || null;
+                const productsDir = require('./lib/select-product').PRODUCTS_DIR;
+                generateSceneImage(
+                  createdRow.id,
+                  plan.title,
+                  plan.direction,
+                  sourceImage,
+                  productsDir
+                ).then(result => {
+                  if (result.dryRun) {
+                    console.log(`scene-gen: dry-run for row ${createdRow.id} — ${result.sceneImageUrl}`);
+                  } else if (result.success) {
+                    console.log(`scene-gen: success for row ${createdRow.id} — image=${result.sceneImageUrl}`);
+                  } else {
+                    console.error(`scene-gen: failed for row ${createdRow.id} — ${result.error}`);
+                  }
+                }).catch(err => {
+                  console.error(`scene-gen: uncaught error for row ${createdRow.id}:`, err.message);
+                });
+              }
             } catch (err) {
               console.error('review card send error:', err);
             }
