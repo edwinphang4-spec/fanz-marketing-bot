@@ -758,45 +758,27 @@ bot.on('callback_query', async (cb) => {
         reply_markup: { inline_keyboard: [] },
       });
 
-      // Trigger imagery pipeline (I-1 → I-2 → I-3 → I-4) as fire-and-forget
+      // Trigger imagery pipeline (I-2 → I-3 → I-4) via orchestrator
       if (supabase.isConfigured()) {
-        const { selectProductImage } = require('./lib/select-product');
-        const { generateSceneImage } = require('./lib/scene-gen');
-        const productsDir = require('./lib/select-product').PRODUCTS_DIR;
+        const { runImageryPipeline } = require('./lib/pipeline');
 
-        // Read current row to get topic/pillar
         const row = await supabase.getContentCalendar(rowId);
         if (row) {
-          const sourceImage = row.source_product_image || null;
-
-          generateSceneImage(
-            rowId,
-            row.topic || '',
-            row.pillar || 'product',
-            sourceImage,
-            productsDir
-          ).then(async (result) => {
+          runImageryPipeline(rowId).then(async (result) => {
             if (result.success) {
-              if (result.idempotent) {
-                // Already had imagery — send image review card directly
-                const sceneUrl = result.sceneImageUrl || row.scene_image_url || '(placeholder)';
-                await sendImageReviewCard(chatId, rowId, sceneUrl, result.imageStatus);
-              } else if (result.dryRun) {
-                console.log(`scene-gen: dry-run for row ${rowId} — ${result.sceneImageUrl}`);
-                await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
-                await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(dry-run)', 'generated', true);
+              if (result.isDryRun) {
+                console.log(`imagery-pipeline: dry-run for row ${rowId} — ${result.imageUrl}`);
+                await sendImageReviewCard(chatId, rowId, result.imageUrl || '(dry-run)', 'generated', true);
               } else {
-                console.log(`scene-gen: success for row ${rowId} — image=${result.sceneImageUrl}`);
-                await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
-                await sendImageReviewCard(chatId, rowId, result.sceneImageUrl, 'generated');
+                console.log(`imagery-pipeline: success for row ${rowId} — ${result.imageUrl}`);
+                await sendImageReviewCard(chatId, rowId, result.imageUrl, 'generated');
               }
             } else {
-              // Technical failure — stay at copy_approved, notify user
-              console.error(`scene-gen: failed for row ${rowId} — ${result.error}`);
+              console.error(`imagery-pipeline: failed for row ${rowId} — ${result.error}`);
               await sendTechnicalFailureNotice(chatId, rowId);
             }
           }).catch(async (err) => {
-            console.error(`scene-gen: uncaught error for row ${rowId}:`, err.message);
+            console.error(`imagery-pipeline: uncaught error for row ${rowId}:`, err.message);
             await sendTechnicalFailureNotice(chatId, rowId);
           });
         }
@@ -1122,22 +1104,42 @@ async function sendWithSplitRaw(chatId, text, options) {
  * Send imagery review card for user to approve/reject the generated scene image.
  * @param {number} [retryCount] - optional retry count for callback_data, default 0
  */
-async function sendImageReviewCard(chatId, rowId, sceneImageUrl, status, isDryRun, retryCount) {
-  const dryRunLabel = isDryRun ? ' (dry-run)' : '';
+async function sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, retryCount) {
   const count = typeof retryCount === 'number' ? retryCount : 0;
-  const message = `🖼️ *Image Review Required${dryRunLabel}*\n\nScene image generated: \`${sceneImageUrl}\`\nStatus: ${status}\n\nIs this image suitable for the post?`;
+  const caption = `🖼️ *Image Review* — Is this suitable for the post?`;
 
-  await bot.sendMessage(chatId, message, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: '✅ Approve Image', callback_data: `image_approve:${rowId}` },
-          { text: '✏️ Regenerate', callback_data: `image_reject:${rowId}:${count}` },
-        ],
+  const keyboard = {
+    inline_keyboard: [
+      [
+        { text: '✅ Approve Image', callback_data: `image_approve:${rowId}` },
+        { text: '✏️ Regenerate', callback_data: `image_reject:${rowId}:${count}` },
       ],
-    },
-  });
+    ],
+  };
+
+  if (isDryRun || !imageUrl || imageUrl.startsWith('(')) {
+    // Dry-run or placeholder — send text message
+    await bot.sendMessage(chatId,
+      `🖼️ *Image Review (dry-run)*\n\nURL: ${imageUrl}\nStatus: ${status}\n\nIs this suitable for the post?`,
+      { parse_mode: 'Markdown', reply_markup: keyboard }
+    );
+  } else {
+    // Send actual photo with inline buttons
+    try {
+      await bot.sendPhoto(chatId, imageUrl, {
+        caption: caption + '\n\n' + (status ? `_Status: ${status}_` : ''),
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+    } catch (photoErr) {
+      // If sendPhoto fails (e.g. URL not accessible), fallback to text
+      console.error('sendPhoto failed, falling back to text:', photoErr.message);
+      await bot.sendMessage(chatId,
+        `🖼️ *Image Review*\n\nImage URL: ${imageUrl}\nStatus: ${status}\n\nIs this suitable for the post?`,
+        { parse_mode: 'Markdown', reply_markup: keyboard }
+      );
+    }
+  }
 }
 
 /**
@@ -1166,11 +1168,10 @@ async function sendTechnicalFailureNotice(chatId, rowId) {
  */
 async function triggerImageRegeneration(rowId, chatId, count) {
   try {
+    const { runImageryPipeline } = require('./lib/pipeline');
+
     const supabase = require('./lib/supabase');
     const { resetImageStatus } = require('./lib/image-state');
-    const { generateSceneImage } = require('./lib/scene-gen');
-    const { selectProductImage } = require('./lib/select-product');
-    const productsDir = require('./lib/select-product').PRODUCTS_DIR;
 
     // Reset image_status to 'generating'
     await resetImageStatus(rowId);
@@ -1182,18 +1183,11 @@ async function triggerImageRegeneration(rowId, chatId, count) {
       return;
     }
 
-    const result = await generateSceneImage(
-      rowId,
-      row.topic || '',
-      row.pillar || 'product',
-      row.source_product_image || null,
-      productsDir
-    );
+    const result = await runImageryPipeline(rowId);
 
     if (result.success) {
-      await supabase.updateContentCalendar(rowId, { status: 'image_ready' });
       const retryLabel = count ? ` (retry #${count})` : '';
-      await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(scene)', 'generated' + retryLabel, result.dryRun, count);
+      await sendImageReviewCard(chatId, rowId, result.imageUrl || '(scene)', 'generated' + retryLabel, result.isDryRun, count);
     } else {
       // Still failed
       await sendTechnicalFailureNotice(chatId, rowId);
