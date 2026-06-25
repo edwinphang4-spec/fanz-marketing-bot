@@ -333,10 +333,15 @@ try {
   publishResult = await publishToSocial(mockRow);
   ok('publishToSocial returned result');
   
-  if (publishResult.post_id && publishResult.post_id.startsWith('DRYRUN-')) {
-    ok(`post_id starts with DRYRUN-: ${publishResult.post_id.slice(0, 20)}...`);
+  if (publishResult.fb_post_id && publishResult.fb_post_id.startsWith('DRYRUN-FB-')) {
+    ok(`fb_post_id starts with DRYRUN-FB-: ${publishResult.fb_post_id.slice(0, 20)}...`);
   } else {
-    fail(`post_id "${publishResult.post_id}" missing DRYRUN- prefix`);
+    fail(`fb_post_id "${publishResult.fb_post_id}" missing DRYRUN-FB- prefix`);
+  }
+  if (publishResult.ig_post_id && publishResult.ig_post_id.startsWith('DRYRUN-IG-')) {
+    ok(`ig_post_id starts with DRYRUN-IG-: ${publishResult.ig_post_id.slice(0, 20)}...`);
+  } else {
+    fail(`ig_post_id "${publishResult.ig_post_id}" missing DRYRUN-IG- prefix`);
   }
   
   if (publishResult.dry_run === true) ok('dry_run flag is true');
@@ -359,11 +364,11 @@ try {
 section('IDEMPOTENCY: Error handling scenarios');
 
 // Already-published row
-const publishedRow = { ...mockRow, post_id: 'DRYRUN-1234567890', status: 'published' };
+const publishedRow = { ...mockRow, fb_post_id: 'DRYRUN-FB-1234567890', ig_post_id: 'DRYRUN-IG-1234567890', status: 'published' };
 try {
   const result = await publishToSocial(publishedRow);
-  // This will succeed because publishToSocial doesn't check post_id — the bot handler does
-  // But the new post_id will be different
+  // This will succeed because publishToSocial doesn't check fb_post_id — the bot handler does
+  // But the new fb_post_id will be different
   ok(`publishToSocial on published row: returns post_id (handler idempotency is at callback level)`);
 } catch (err) {
   ok(`publishToSocial on published row blocked: ${err.message.substring(0, 60)}...`);
@@ -404,14 +409,14 @@ const telegramPayload = { status: 'approved' };
 ok(`Telegram approve payload: ${JSON.stringify(telegramPayload)}`);
 
 // Dashboard path (publish via API)
-const dashPostId = `DRYRUN-${Date.now()}`;
-const dashUpdatePayload = { post_id: dashPostId, status: 'published' };
-ok(`Dashboard publish payload: post_id=${dashPostId}, status=published`);
+const dashTs = Date.now();
+const dashUpdatePayload = { fb_post_id: 'DRYRUN-FB-' + dashTs, ig_post_id: 'DRYRUN-IG-' + dashTs, status: 'published' };
+ok('Dashboard publish payload: fb_post_id=' + dashUpdatePayload.fb_post_id + ', ig_post_id=' + dashUpdatePayload.ig_post_id + ', status=published');
 
 // Verify both paths would end up with the same DB state
 // (Both use supabase.updateContentCalendar with TOCTOU guard)
-ok(`Telegram approve: status→approved ✓`);
-ok(`Dashboard publish: post_id=${dashPostId} → status=published ✓`);
+ok('Telegram approve: status→approved ✓');
+ok('Dashboard publish: fb_post_id=' + dashUpdatePayload.fb_post_id + ' → status=published ✓');
 ok(`Concurrent operations protected by TOCTOU guard in updateContentCalendar ✓`);
 
 // ============================================

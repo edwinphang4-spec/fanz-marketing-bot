@@ -219,26 +219,28 @@ async function step4_publish(row) {
   const freshRow = await sbSelect(row.id);
   console.log(`\n[PUBLISH] Calling publishToSocial (dry-run) using fresh SELECT row...`);
   const publishResult = await publishToSocial(freshRow);
-  console.log(`  post_id: ${publishResult.post_id}`);
-  console.log(`  dry_run: ${publishResult.dry_run}`);
+  console.log('  fb_post_id: ' + publishResult.fb_post_id);
+  console.log('  ig_post_id: ' + publishResult.ig_post_id);
+  console.log('  dry_run: ' + publishResult.dry_run);
   console.log(`  fb: ${publishResult.payload.facebook.message.substring(0, 60)}...`);
   console.log(`  ig: ${publishResult.payload.instagram.caption.substring(0, 60)}...`);
 
-  if (!publishResult.post_id.startsWith('DRYRUN-')) {
-    console.error(`✗ FATAL: Expected DRYRUN- prefix in post_id, got "${publishResult.post_id}"`);
+if (!publishResult.fb_post_id.startsWith('DRYRUN-FB-') || !publishResult.ig_post_id.startsWith('DRYRUN-IG-')) {
+    console.error('✗ FATAL: Expected DRYRUN-FB- / DRYRUN-IG- prefixes, got fb="' + publishResult.fb_post_id + '" ig="' + publishResult.ig_post_id + '"');
     process.exit(1);
   }
-  ok('publishToSocial returned DRYRUN- prefixed post_id ✓');
+  ok('publishToSocial returned DRYRUN-FB-/DRYRUN-IG- prefixed ids ✓');
 
-  // Update to published — use fb_post_id (column exists in schema)
-  console.log('\n[DB] Updating to status=published with fb_post_id...');
+  // Update to published — write both fb_post_id and ig_post_id (columns exist in schema)
+  console.log('\n[DB] Updating to status=published with fb_post_id + ig_post_id...');
   const rowPublished = await supabase.updateContentCalendar(row.id, {
-    fb_post_id: publishResult.post_id,
+    fb_post_id: publishResult.fb_post_id,
+    ig_post_id: publishResult.ig_post_id,
     status: 'published',
   });
-  console.log(`  id=${rowPublished.id} status=${rowPublished.status} fb_post_id=${rowPublished.fb_post_id}`);
+  console.log('  id=' + rowPublished.id + ' status=' + rowPublished.status + ' fb_post_id=' + rowPublished.fb_post_id + ' ig_post_id=' + rowPublished.ig_post_id);
   const verify2 = await sbSelect(row.id);
-  console.log(`  [VERIFY] Raw SELECT: id=${verify2.id} status="${verify2.status}" fb_post_id="${verify2.fb_post_id}"`);
+  console.log('  [VERIFY] Raw SELECT: id=' + verify2.id + ' status="' + verify2.status + '" fb_post_id="' + verify2.fb_post_id + '" ig_post_id="' + verify2.ig_post_id + '"');
   if (verify2.status !== 'published') {
     console.error(`✗ FATAL: Expected status=published, got "${verify2.status}"`);
     process.exit(1);
@@ -378,7 +380,7 @@ async function main() {
     console.log('');
     console.log('  STEP 4: Approve → Publish (dry-run)');
     console.log('    ✓ Supabase row status=approved');
-    console.log('    ✓ publishToSocial() → post_id: ' + rowPublished.post_id);
+    console.log('    ✓ publishToSocial() → fb_post_id: ' + (rowPublished.fb_post_id || '(none)') + ', ig_post_id: ' + (rowPublished.ig_post_id || '(none)'));
     console.log('    ✓ Supabase row status=published');
     console.log('');
     console.log('🟢 REJECTION PATH — ALL ' + createdRows.length + ' ROWS PASSED:');

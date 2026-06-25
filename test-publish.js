@@ -180,7 +180,8 @@ const publishRow = {
 (async () => {
   try {
     const result = await publishToSocial(publishRow);
-    assertStartsWith(result.post_id, 'DRYRUN-', '7a. post_id starts with DRYRUN-');
+    assertStartsWith(result.fb_post_id, 'DRYRUN-FB-', '7a. fb_post_id starts with DRYRUN-FB-');
+    assertStartsWith(result.ig_post_id, 'DRYRUN-IG-', '7b. ig_post_id starts with DRYRUN-IG-');
     assert(result.dry_run === true, '8a. dry_run is true on result');
     assert(typeof result.payload === 'object', '9a. payload is present on result');
     assert(result.payload.facebook.message === 'Test Facebook content for publish', '9b. payload contains fb_content');

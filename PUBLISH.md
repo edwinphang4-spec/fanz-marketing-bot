@@ -2,7 +2,7 @@
 
 ## 原则
 - 只有最后一脚（打 Meta API）用 DRYRUN 控制，其他全部真实
-- DRYRUN 由环境变量 `DRYRUN` 控制（默认 true），post_id 加 `DRYRUN-` 前缀
+- DRYRUN 由环境变量 `DRYRUN` 控制（默认 true），返回 `fb_post_id` + `ig_post_id` 各带 `DRYRUN-FB-/IG-` 前缀
 - 不准假实现蔓延
 
 ## 1. lib/publish.js — 核心发布模块
@@ -44,7 +44,7 @@ function validatePublishPayload(payload) {
 
 /**
  * 执行发布
- * - DRY_RUN=true（默认）：只模拟，返回 DRYRUN- 前缀 post_id
+ * - DRY_RUN=true（默认）：只模拟，返回 DRYRUN- 前缀 fb_post_id + ig_post_id
  * - DRY_RUN=false：调用真实 Meta API（当前抛未实现错误，等接入凭据后）
  * 
  * dry-run 只限这一脚
@@ -57,10 +57,10 @@ async function publishToSocial(row) {
   }
 
   if (DRY_RUN) {
+    const ts = Date.now();
     return {
-      post_id: `DRYRUN-${Date.now()}`,
-      fb_post_id: null,
-      ig_post_id: null,
+      fb_post_id: `DRYRUN-FB-${ts}`,
+      ig_post_id: `DRYRUN-IG-${ts}`,
       dry_run: true,
       payload,
     };
@@ -95,11 +95,11 @@ reply_markup: {
 
 流程：
 1. 读当前行（`getContentCalendar(rowId)`）
-2. **幂等检查**：如果已有 post_id → 直接回答案 "Already published: {post_id}"
+2. **幂等检查**：如果已有 fb_post_id 或 ig_post_id → 直接回答案 "Already published: FB: {fb_post_id}, IG: {ig_post_id}"
 3. 状态检查：if status !== 'approved' → answer "Cannot publish — status is {status}"
 4. 调用 `publishToSocial(row)` → 返回 result
-5. 更新 DB：`updateContentCalendar(rowId, { post_id: result.post_id, status: 'published' })`
-6. 编辑消息追加 "🚀 Published (dry-run: {result.post_id})" 并清键盘
+5. 更新 DB：`updateContentCalendar(rowId, { fb_post_id: result.fb_post_id, ig_post_id: result.ig_post_id, status: 'published' })`
+6. 编辑消息追加 "🚀 Published (dry-run: FB: \`{fb_post_id}\`, IG: \`{ig_post_id}\`)" 并清键盘
 7. 异常处理：失败时 answerCallbackQuery + console.error，不改变状态
 
 ### 2c. require
@@ -113,10 +113,10 @@ reply_markup: {
 3. validatePublishPayload 验证非空内容通过
 4. validatePublishPayload 空内容报错
 5. validatePublishPayload 占位符报错
-6. publishToSocial dry-run 返回 DRYRUN- 前缀的 post_id
+6. publishToSocial dry-run 返回 DRYRUN-FB-/DRYRUN-IG- 前缀的 fb_post_id + ig_post_id（不再用单 post_id）
 7. publishToSocial dry-run 设置 dry_run=true
 8. publishToSocial 执行完整的 assemble → validate → publish 链路
-9. 幂等检查：重复调用同一行返回已有 post_id（需 mock row 有 post_id）
+9. 幂等检查：重复调用同一行返回已有 fb_post_id/ig_post_id（handler 层面，非 publishToSocial 自身）
 10. 状态检查：非 approved 状态报错
 
 ## 4. test-publish.sh

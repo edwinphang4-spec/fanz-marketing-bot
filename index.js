@@ -822,24 +822,34 @@ bot.on('callback_query', async (cb) => {
         return;
       }
       // Idempotency check: already published?
-      if (row.post_id) {
-        await bot.answerCallbackQuery(cb.id, { text: `Already published: ${row.post_id}` });
+      const chartIds = [];
+      if (row.fb_post_id) chartIds.push('FB: ' + row.fb_post_id);
+      if (row.ig_post_id) chartIds.push('IG: ' + row.ig_post_id);
+      if (chartIds.length > 0) {
+        await bot.answerCallbackQuery(cb.id, { text: 'Already published: ' + chartIds.join(', ') });
         return;
       }
       // Status check
       if (row.status !== 'approved') {
-        await bot.answerCallbackQuery(cb.id, { text: `Cannot publish — status is "${row.status}"` });
+        await bot.answerCallbackQuery(cb.id, { text: 'Cannot publish — status is "' + row.status + '"' });
         return;
       }
       // Execute publish
       const result = await publishToSocial(row);
-      // Update DB
-      await supabase.updateContentCalendar(rowId, { post_id: result.post_id, status: 'published' });
+      // Update DB — write fb_post_id + ig_post_id separately (table has no single post_id column)
+      await supabase.updateContentCalendar(rowId, {
+        fb_post_id: result.fb_post_id,
+        ig_post_id: result.ig_post_id,
+        status: 'published',
+      });
       // Edit message
       const originalText = (message && message.text) || '';
+      const publishedRefs = [];
+      if (result.fb_post_id) publishedRefs.push('FB: `' + result.fb_post_id + '`');
+      if (result.ig_post_id) publishedRefs.push('IG: `' + result.ig_post_id + '`');
       const suffix = result.dry_run
-        ? `\n\n🚀 Published (dry-run: \`${result.post_id}\`)`
-        : `\n\n🚀 Published: \`${result.post_id}\``;
+        ? '\n\n🚀 Published (dry-run: ' + publishedRefs.join(', ') + ')'
+        : '\n\n🚀 Published: ' + publishedRefs.join(', ');
       await bot.editMessageText(originalText + suffix, {
         chat_id: chatId,
         message_id: messageId,
