@@ -1,9 +1,9 @@
 // ============================================
-// test-scene-gen.js — Nano Banana 场景图生成自测 [I-2]
+// test-scene-gen.js — GPT Image 2 场景图生成自测 [I-2]
 //
 // Part A: 纯函数（无需 DB / API key）
 // Part B: DB 集成（需 SUPABASE_URL + SUPABASE_SERVICE_KEY，不碰真实资产）
-// Part C: API 集成（需 GEMINI_API_KEY，注入临时产品图）
+// Part C: API 集成（需 OPENAI_API_KEY，注入临时产品图）
 // ============================================
 
 const assert = require('assert');
@@ -104,9 +104,9 @@ try {
 }
 
 // ──────────────────────────────────────────
-// 5. callNanoBanana dry-run 返回带 DRYRUN 标记的数据
+// 5. callGptImage2 dry-run 返回带 DRYRUN 标记的数据
 // ──────────────────────────────────────────
-console.log('Test 5: callNanoBanana dry-run returns data with dryRun flag');
+console.log('Test 5: callGptImage2 dry-run returns data with dryRun flag');
 try {
   const tmpDir = makeTempDir('dryrun');
   try {
@@ -116,16 +116,16 @@ try {
       'base64'
     ));
 
-    const origKey = process.env.GEMINI_API_KEY;
-    delete process.env.GEMINI_API_KEY;
+    const origKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
 
-    const result = await sceneGen.callNanoBanana('test prompt', testImage);
+    const result = await sceneGen.callGptImage2('test prompt', testImage);
     assert.ok(result.dryRun === true, 'Should have dryRun=true');
     assert.ok(Buffer.isBuffer(result.data), 'Should return buffer data');
     assert.ok(result.data.length > 0, 'Buffer should not be empty');
     console.log('  PASS (dry-run placeholder returned)');
 
-    if (origKey) process.env.GEMINI_API_KEY = origKey;
+    if (origKey) process.env.OPENAI_API_KEY = origKey;
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -134,24 +134,24 @@ try {
 }
 
 // ──────────────────────────────────────────
-// 6. callNanoBanana 对缺失产品图抛异常
+// 6. callGptImage2 对缺失产品图抛异常
 // ──────────────────────────────────────────
-console.log('Test 6: callNanoBanana with fake API key + missing image throws error');
+console.log('Test 6: callGptImage2 with fake API key + missing image throws error');
 try {
-  const origKey = process.env.GEMINI_API_KEY;
-  process.env.GEMINI_API_KEY = 'fake-test-key';
+  const origKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = 'fake-test-key';
 
   try {
-    await sceneGen.callNanoBanana('test', '/nonexistent/image.png');
+    await sceneGen.callGptImage2('test', '/nonexistent/image.png');
     fail('Should have thrown for missing image');
   } catch (err) {
     assert.ok(err.message.includes('not found'), `Error should mention "not found", got: "${err.message}"`);
     console.log('  PASS');
   } finally {
     if (origKey) {
-      process.env.GEMINI_API_KEY = origKey;
+      process.env.OPENAI_API_KEY = origKey;
     } else {
-      delete process.env.GEMINI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
     }
   }
 } catch (e) {
@@ -170,8 +170,8 @@ try {
     const testProductImage = 'fs-series-test.svg';
     fs.writeFileSync(path.join(productsDir, testProductImage), '<svg xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="40"/></svg>');
 
-    const origKey = process.env.GEMINI_API_KEY;
-    delete process.env.GEMINI_API_KEY;
+    const origKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
 
     const origSupabase = require('./lib/supabase');
     const origImageState = require('./lib/image-state');
@@ -200,7 +200,7 @@ try {
 
     origSupabase.getContentCalendar = origGet;
     origImageState.updateImageRow = origUpdateImageRow;
-    if (origKey) process.env.GEMINI_API_KEY = origKey;
+    if (origKey) process.env.OPENAI_API_KEY = origKey;
   } finally {
     cleanupTempDir(tmpDir);
   }
@@ -253,8 +253,8 @@ try {
     return { id, ...data };
   };
 
-  const origKey = process.env.GEMINI_API_KEY;
-  process.env.GEMINI_API_KEY = 'invalid-key';
+  const origKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = 'invalid-key';
 
   const tmpDir = makeTempDir('failure');
   try {
@@ -272,9 +272,9 @@ try {
   } finally {
     cleanupTempDir(tmpDir);
     if (origKey) {
-      process.env.GEMINI_API_KEY = origKey;
+      process.env.OPENAI_API_KEY = origKey;
     } else {
-      delete process.env.GEMINI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
     }
     origSupabase.getContentCalendar = origGet;
     origImageState.updateImageRow = origUpdate;
@@ -284,48 +284,47 @@ try {
 }
 
 // ──────────────────────────────────────────
-// 10. 超时保护配置正确（AbortController 30s）
-// ──────────────────────────────────────────
-console.log('Test 10: Timeout protection — API_TIMEOUT_MS is 30s');
+// 10. 超时保护配置正确（AbortController 90s）
+console.log('Test 10: Timeout protection — API_TIMEOUT_MS is 90s');
 try {
-  assert.strictEqual(sceneGen.API_TIMEOUT_MS, 30_000, 'API_TIMEOUT_MS should be 30,000ms');
+  assert.strictEqual(sceneGen.API_TIMEOUT_MS, 90_000, 'API_TIMEOUT_MS should be 90,000ms');
   console.log('  PASS');
 } catch (e) {
   fail(e.message);
 }
 
 // ──────────────────────────────────────────
-// 11. DRY_RUN 由 GEMINI_API_KEY 控制
+// 11. DRY_RUN 由 OPENAI_API_KEY 控制
 // ──────────────────────────────────────────
-console.log('Test 11: DRY_RUN is controlled by GEMINI_API_KEY');
+console.log('Test 11: DRY_RUN is controlled by OPENAI_API_KEY');
 try {
-  const origKey = process.env.GEMINI_API_KEY;
+  const origKey = process.env.OPENAI_API_KEY;
 
   // Without key → dry-run
-  delete process.env.GEMINI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
   const tmpDir = makeTempDir('dry2');
   try {
     const testImage = path.join(tmpDir, 'dummy.png');
     fs.writeFileSync(testImage, 'dummy');
-    const r1 = await sceneGen.callNanoBanana('test', testImage);
+    const r1 = await sceneGen.callGptImage2('test', testImage);
     assert.ok(r1.dryRun === true, 'Without API key, should be dry-run');
-    console.log('    ✓ Without GEMINI_API_KEY → dry-run');
+    console.log('    ✓ Without OPENAI_API_KEY → dry-run');
 
     // With key → should try real API
-    process.env.GEMINI_API_KEY = 'some-key';
+    process.env.OPENAI_API_KEY = 'some-key';
     try {
-      const r2 = await sceneGen.callNanoBanana('test', testImage);
+      const r2 = await sceneGen.callGptImage2('test', testImage);
       assert.ok(!r2.dryRun, 'With API key set, dryRun should be falsy');
     } catch (err) {
       assert.ok(!err.message.includes('DRYRUN'),
         `Error should be real API error, not dry-run. Got: "${err.message}"`);
-      console.log('    ✓ With GEMINI_API_KEY → tried real API (failed as expected with invalid key)');
+      console.log('    ✓ With OPENAI_API_KEY → tried real API (failed as expected with invalid key)');
     }
     console.log('  PASS');
   } finally {
     cleanupTempDir(tmpDir);
-    if (origKey) process.env.GEMINI_API_KEY = origKey;
-    else delete process.env.GEMINI_API_KEY;
+    if (origKey) process.env.OPENAI_API_KEY = origKey;
+    else delete process.env.OPENAI_API_KEY;
   }
 } catch (e) {
   fail(e.message);
@@ -407,7 +406,7 @@ if (!supabaseUrl || !supabaseKey) {
         body: JSON.stringify({
           status: 'draft',
           pillar: 'product',
-          topic: 'Nano Banana scene test',
+          topic: 'GPT Image 2 scene test',
           chat_id: 'test-scene-gen',
         }),
       });
@@ -430,12 +429,12 @@ if (!supabaseUrl || !supabaseKey) {
         const testSvg = 'fs-series-test-db.svg';
         fs.writeFileSync(path.join(productsDir, testSvg), '<svg xmlns="http://www.w3.org/2000/svg"><rect width="100" height="100"/></svg>');
 
-        const origKey = process.env.GEMINI_API_KEY;
-        delete process.env.GEMINI_API_KEY;
+        const origKey = process.env.OPENAI_API_KEY;
+        delete process.env.OPENAI_API_KEY;
 
         const result = await sceneGen.generateSceneImage(
           testRowId,
-          'Nano Banana scene test',
+          'GPT Image 2 scene test',
           'product',
           testSvg,
           productsDir
@@ -463,7 +462,7 @@ if (!supabaseUrl || !supabaseKey) {
 
         console.log(`  PASS (row ${testRowId}: image_status=${updated.image_status}, scene_image_url=${updated.scene_image_url})`);
 
-        if (origKey) process.env.GEMINI_API_KEY = origKey;
+        if (origKey) process.env.OPENAI_API_KEY = origKey;
       } finally {
         cleanupTempDir(tmpDir);
       }

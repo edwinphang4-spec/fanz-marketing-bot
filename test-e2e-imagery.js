@@ -14,10 +14,10 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.MODEL || 'gpt-4o';
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 // Force dry-run for E2E imagery test — we're testing pipeline logic, not real image gen
-process.env.GEMINI_API_KEY = '';
+process.env.OPENAI_API_KEY = '';
 const FORCE_DRY_RUN = true;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
@@ -117,8 +117,8 @@ async function step3_runPipeline(rowId) {
 
   const { runImageryPipeline } = require('./lib/pipeline');
 
-  const dryRunMode = !process.env.GEMINI_API_KEY;
-  console.log(`  GEMINI_API_KEY set: ${!!process.env.GEMINI_API_KEY} → mode: ${dryRunMode ? 'DRY-RUN' : 'REAL'}`);
+  const dryRunMode = !process.env.OPENAI_API_KEY;
+  console.log(`  OPENAI_API_KEY set: ${!!process.env.OPENAI_API_KEY} → mode: ${dryRunMode ? 'DRY-RUN' : 'REAL'}`);
 
   const result = await runImageryPipeline(rowId);
   capturedImageUrl = result.imageUrl || null;
@@ -364,7 +364,7 @@ async function summary(rowId) {
 (async function main() {
   console.log('='.repeat(80));
   console.log('  FANZ MARKETING BOT — E2E IMAGERY PIPELINE TEST');
-  console.log(`  Dry-run mode: ${!GEMINI_KEY} (GEMINI_API_KEY ${GEMINI_KEY ? 'SET' : 'NOT SET'})`);
+  console.log(`  Dry-run mode: ${!OPENAI_KEY} (OPENAI_API_KEY ${OPENAI_KEY ? 'SET' : 'NOT SET'})`);
   console.log(`  Time: ${new Date().toISOString()}`);
   console.log('='.repeat(80));
 

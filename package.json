@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
+    "openai": "^6.45.0",
     "sharp": "^0.35.2"
   }
 }

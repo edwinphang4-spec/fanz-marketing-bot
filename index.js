@@ -57,8 +57,6 @@ try {
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.MODEL || 'gpt-4o';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-image';
 const PRODUCT_IMAGE = path.join(__dirname, 'images', 'ceiling-fan-sample.jpg');
 const PLAN_SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -630,78 +628,59 @@ bot.on('message', async (msg) => {
 });
 
 // ============================================
-// IMAGE EDITING (Nano Banana via Gemini API)
+// IMAGE EDITING (GPT Image 2 via OpenAI images.edit)
 // ============================================
 
-// Convert image file to base64
-function imageToBase64(filePath) {
-  const data = fs.readFileSync(filePath);
-  return data.toString('base64');
-}
-
-// Call Gemini Nano Banana for image-to-image editing
-async function geminiEditImage(prompt) {
-  if (!GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY not configured. Please set this environment variable.');
+// Call GPT Image 2 for image-to-image editing
+async function gptImage2Edit(prompt) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY not configured. Please set this environment variable.');
   }
 
   if (!fs.existsSync(PRODUCT_IMAGE)) {
     throw new Error(`Product image not found at ${PRODUCT_IMAGE}. Please place a Fanz product image there.`);
   }
 
-  const base64Image = imageToBase64(PRODUCT_IMAGE);
+  const OpenAI = require('openai');
+  const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+
+  const imageBuffer = fs.readFileSync(PRODUCT_IMAGE);
   const mimeType = PRODUCT_IMAGE.endsWith('.png') ? 'image/png' : 'image/jpeg';
+  const imageFile = new File([imageBuffer], 'product-image.png', { type: mimeType });
 
-  const response = await fetch(
-`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{
-          role: 'user',
-          parts: [
-            { text: prompt },
-            {
-              inline_data: {
-                mime_type: mimeType,
-                data: base64Image,
-              },
-            },
-          ],
-        }],
-        generationConfig: {
-          temperature: 1.0,
-          topK: 32,
-          topP: 1,
-          maxOutputTokens: 8192,
-        },
-      }),
+  const response = await openai.images.edit({
+    model: 'gpt-image-2',
+    image: imageFile,
+    prompt: prompt,
+    size: '1024x1024',
+    quality: process.env.GPT_IMAGE_QUALITY || 'medium',
+    n: 1,
+  });
+
+  if (!response.data || response.data.length === 0) {
+    throw new Error('GPT Image 2 returned no data');
+  }
+
+  const firstResult = response.data[0];
+  if (firstResult.b64_json) {
+    return {
+      data: Buffer.from(firstResult.b64_json, 'base64'),
+      mimeType: 'image/png',
+    };
+  } else if (firstResult.url) {
+    const imgResp = await fetch(firstResult.url);
+    if (!imgResp.ok) {
+      throw new Error(`Failed to download generated image: ${imgResp.status}`);
     }
-  );
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Gemini API error ${response.status}: ${errText}`);
+    return {
+      data: Buffer.from(await imgResp.arrayBuffer()),
+      mimeType: 'image/png',
+    };
   }
 
-  const data = await response.json();
-
-  if (!data.candidates || data.candidates.length === 0) {
-    throw new Error('Gemini returned no candidates. The model may not support image output.');
-  }
-
-  // Find image part in response
-  for (const part of data.candidates[0].content.parts) {
-    if (part.inline_data && part.inline_data.data) {
-      return {
-        data: Buffer.from(part.inline_data.data, 'base64'),
-        mimeType: part.inline_data.mime_type || 'image/png',
-      };
-    }
-  }
-
-  throw new Error('Gemini response did not contain an image. Try a different prompt.');
+  throw new Error('GPT Image 2 response did not contain an image.');
 }
 
 // /image command — generate product-in-scene image
@@ -718,15 +697,16 @@ bot.onText(/^\/image\b(.*)/is, async (msg, match) => {
   const statusMsg = await bot.sendMessage(chatId, `⏳ Generating image — putting fan in "${theme}" scene...`);
 
   try {
-    const result = await geminiEditImage(prompt);
+    const result = await gptImage2Edit(prompt);
 
     // Send the generated photo to Telegram
     await bot.sendPhoto(chatId, result.data, {
-      caption: `🎨 "${theme}" — Fanz product in scene\n✅ Generated via Nano Banana (${GEMINI_MODEL})`,
+      caption: `🎨 "${theme}" — Fanz product in scene\n✅ Generated via GPT Image 2`,
     });
 
     // Delete status message
     await bot.deleteMessage(chatId, statusMsg.message_id);
+
   } catch (err) {
     console.error('image error:', err);
     await bot.sendMessage(

@@ -2,7 +2,7 @@
 // ============================================
 // E2E 配图端到端联调 v2
 // ============================================
-process.env.GEMINI_API_KEY = '';
+process.env.OPENAI_API_KEY = '';
 process.env.DRYRUN = 'true';
 process.env.SKIP_BOT_INIT = '1';
 
@@ -295,7 +295,7 @@ async function testRejectLimit() {
   console.log('='.repeat(80));
   console.log('  配图端到端联调');
   console.log('  Time: ' + new Date().toISOString());
-  console.log('  Mode: DRY-RUN (GEMINI_API_KEY="")');
+  console.log('  Mode: DRY-RUN (OPENAI_API_KEY="")');
   console.log('='.repeat(80));
 
   try {
