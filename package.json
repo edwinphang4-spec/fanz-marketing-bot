@@ -7,8 +7,10 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.108.2",
     "node-telegram-bot-api": "^0.66.0",
     "openai": "^6.45.0",
+    "pg": "^8.22.0",
     "sharp": "^0.35.2"
   }
 }
