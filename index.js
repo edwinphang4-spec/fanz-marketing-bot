@@ -112,6 +112,9 @@ const awaitingBatchReviewNotes = new Map();
 // cleared after their next photo is received and processed.
 const awaitingImageUpload = new Map();
 
+// Map<calId, planId> — for monthly calendar action callbacks (short format < 64 bytes)
+const monthActionMap = new Map();
+
 // Map<chatId, { rowId }> — set when user clicks "Change Scene" on an image review card,
 // cleared after their next text message is consumed as the new scene description.
 const awaitingSceneChange = new Map();
@@ -571,14 +574,15 @@ async function buildMonthCalendarMessage(planId) {
     const shortTopic = (row.topic || '').length > 30
       ? (row.topic || '').slice(0, 27) + '...'
       : (row.topic || '');
+    monthActionMap.set(row.id, planId);
     keyboard.push([
-      { text: `✏️ ${shortTopic}`, callback_data: `month_edit_topic:${planId}:${row.id}` },
-      { text: `❌ Remove`, callback_data: `month_remove:${planId}:${row.id}` },
-      { text: `🔄 Replace`, callback_data: `month_replace:${planId}:${row.id}` },
+      { text: `✏️ ${shortTopic}`, callback_data: `me:${row.id}` },
+      { text: `❌ Remove`, callback_data: `mr:${row.id}` },
+      { text: `🔄 Replace`, callback_data: `mrp:${row.id}` },
     ]);
   }
   keyboard.push(
-    [{ text: '✅ Approve this month', callback_data: `month_approve:${planId}` }]
+    [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
   );
 
   return { text: output, keyboard: { inline_keyboard: keyboard } };
@@ -736,14 +740,15 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
         const calId = createdCalendarIds[i];
         if (!calId) continue;
         const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
+        monthActionMap.set(calId, planId);
         keyboardRows.push([
-          { text: `✏️ ${shortTopic}`, callback_data: `month_edit_topic:${planId}:${calId}` },
-          { text: `❌ Remove`, callback_data: `month_remove:${planId}:${calId}` },
-          { text: `🔄 Replace`, callback_data: `month_replace:${planId}:${calId}` },
+          { text: `✏️ ${shortTopic}`, callback_data: `me:${calId}` },
+          { text: `❌ Remove`, callback_data: `mr:${calId}` },
+          { text: `🔄 Replace`, callback_data: `mrp:${calId}` },
         ]);
       }
       keyboardRows.push(
-        [{ text: '✅ Approve this month', callback_data: `month_approve:${planId}` }]
+        [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
       );
     }
 
@@ -1504,14 +1509,15 @@ bot.on('message', async (msg) => {
               const calId = createdCalendarIds[i];
               if (!calId) continue;
               const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
+              monthActionMap.set(calId, planId);
               keyboardRows.push([
-                { text: `✏️ ${shortTopic}`, callback_data: `month_edit_topic:${planId}:${calId}` },
-                { text: `❌ Remove`, callback_data: `month_remove:${planId}:${calId}` },
-                { text: `🔄 Replace`, callback_data: `month_replace:${planId}:${calId}` },
+                { text: `✏️ ${shortTopic}`, callback_data: `me:${calId}` },
+                { text: `❌ Remove`, callback_data: `mr:${calId}` },
+                { text: `🔄 Replace`, callback_data: `mrp:${calId}` },
               ]);
             }
             keyboardRows.push(
-              [{ text: '✅ Approve this month', callback_data: `month_approve:${planId}` }]
+              [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
             );
           }
 
@@ -1752,9 +1758,9 @@ bot.on('callback_query', async (cb) => {
     return;
   }
 
-  // month_approve:planId — approve a monthly plan
-  if (data.startsWith('month_approve:')) {
-    const planId = data.slice('month_approve:'.length);
+  // ma:planId — approve a monthly plan
+  if (data.startsWith('ma:')) {
+    const planId = data.slice('ma:'.length);
     try {
       // Update the content_plans row status from pending_approval to plan_approved
       await supabasePlans.updateContentPlan(planId, { status: 'plan_approved' });
@@ -1794,13 +1800,12 @@ bot.on('callback_query', async (cb) => {
     return;
   }
 
-  // month_edit_topic:planId:postId — Edit topic/angle
-  if (data.startsWith('month_edit_topic:')) {
-    const parts = data.split(':');
-    const planId = parts[1];
-    const postId = parts.slice(2).join(':');
+  // me:calId — Edit topic/angle
+  if (data.startsWith('me:')) {
+    const calId = data.slice('me:'.length);
+    const planId = monthActionMap.get(calId) || '';
     try {
-      awaitingMonthEdits.set(chatId, { planId, postId });
+      awaitingMonthEdits.set(chatId, { planId, postId: calId });
       await bot.answerCallbackQuery(cb.id, { text: 'Send the new topic/angle' });
       const originalText = (message && message.text) || '';
       await bot.editMessageText(originalText + '\n\n✏️ Send the new topic/angle for this post:', {
@@ -1818,11 +1823,10 @@ bot.on('callback_query', async (cb) => {
     return;
   }
 
-  // month_remove:planId:postId — Remove post from plan
-  if (data.startsWith('month_remove:')) {
-    const parts = data.split(':');
-    const planId = parts[1];
-    const postId = parts.slice(2).join(':');
+  // mr:postId — Remove post from plan
+  if (data.startsWith('mr:')) {
+    const postId = data.slice('mr:'.length);
+    const planId = monthActionMap.get(postId) || '';
     try {
       // Read the post for confirmation context
       const row = await supabase.getContentCalendar(postId);
@@ -1845,11 +1849,11 @@ bot.on('callback_query', async (cb) => {
     return;
   }
 
-  // month_replace:planId:postId — Regenerate a single post
-  if (data.startsWith('month_replace:')) {
-    const parts = data.split(':');
-    const planId = parts[1];
-    const postId = parts.slice(2).join(':');
+  // mrp:calId — Regenerate a single post
+  if (data.startsWith('mrp:')) {
+    const calId = data.slice('mrp:'.length);
+    const planId = monthActionMap.get(calId) || '';
+    const postId = calId;
     try {
       await bot.answerCallbackQuery(cb.id, { text: 'Regenerating post...' });
       const originalText = (message && message.text) || '';
@@ -2646,4 +2650,5 @@ module.exports = {
   sendImageReviewCard,
   sendTechnicalFailureNotice,
   triggerImageRegeneration,
+  monthActionMap,
 };
