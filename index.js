@@ -14,6 +14,7 @@ const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-p
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
 const { schedulePlan, formatScheduleTable } = require('./lib/monthly-scheduler');
 const { checkTodayPosts, buildReminderMessage } = require('./cron-publish-reminder');
+const { classifyIntent } = require('./lib/intent-router');
 
 // ============================================
 // VERSION / GIT COMMIT SHA
@@ -174,7 +175,14 @@ function buildRejectPayload(notes) {
 //   digit + plan      → 'plan_selection'
 //   awaiting review   → 'review_notes'
 //   starts with /     → 'command'
-//   otherwise         → 'free_text'
+//   otherwise         → 'free_text'  (routed through classifyIntent() for intent-based handling)
+//                                      See lib/intent-router.js for intent classification.
+//                                      The classifyIntent() call dispatches to:
+//                                        chitchat   → consultant reply
+//                                        plan_month → monthly planning flow
+//                                        generate_post → generateContent(pillar, topic)
+//                                        ask_question  → consultant answers
+//                                        unclear       → asks clarifying question
 function decideMessageIntent(text, hasPlanSession, hasAwaitingReview) {
   if (typeof text !== 'string' || text.length === 0) return 'skip';
   if (/^[1-9]\d{0,2}$/.test(text) && hasPlanSession) return 'plan_selection';
@@ -419,20 +427,29 @@ if (!SKIP_BOT_INIT) {
 // /start
 bot.onText(/^\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const welcome = `🤖 Welcome to Fanz Marketing Bot!
+  const welcome = `🤖 *Fanz Marketing Consultant*
 
-I help you create professional social media content for Fanz Sdn Bhd.
+I'm your professional marketing colleague from Fanz Sdn Bhd. I can:
 
-Available commands:
+📅 Plan monthly content calendars
+✍️ Write individual social media posts (FB/IG)
+🖼️ Generate product-in-scene images
+💡 Give marketing advice & answer product questions
+
+*Available commands:*
 /plan [context] — AI content planning (suggest topics → pick → generate)
 /product [brief] — Generate product promotion post
 /case [details] — Generate installation case study post
 /promo [details] — Generate promotion / campaign post
 /story [context] — Generate brand story post
+/plan_month — Generate a full-month content calendar
+/schedule_month — Schedule approved posts
 
-Just type any message without a command, and I'll treat it as a product promotion brief!
+Just send me a message and I'll figure out what you need!
 
-Example: /product Let's promote our new Smart Series fan with WiFi control`;
+Example: /product Let's promote our new Smart Series fan with WiFi control
+
+同时支持中文交流 🇨🇳`;
 
   await bot.sendMessage(chatId, welcome);
 });
@@ -1358,13 +1375,185 @@ bot.on('message', async (msg) => {
   // Skip commands (already handled above)
   if (text && text.startsWith('/')) return;
 
-  await bot.sendMessage(chatId, '⏳ Generating content based on your message...');
+  // === FREE TEXT — ROUTE THROUGH INTENT CLASSIFIER ===
   try {
-    const content = await generateContent('freetext', text);
-    await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
+    const brandContext = buildProductContext();
+    const classification = await classifyIntent(text, brandContext);
+
+    switch (classification.intent) {
+      case 'chitchat':
+      case 'greeting':
+        // Consultant-style friendly response
+        await bot.sendMessage(chatId, classification.response || 'Hi! How can I help you with your Fanz marketing today?');
+        break;
+
+      case 'plan_month':
+        // Trigger the monthly planning flow (same as /plan_month command)
+        await bot.sendMessage(chatId, '📅 Starting monthly content planning...');
+        // Simulate the /plan_month command by running the handler logic inline.
+        // We create a mock msg object and invoke the same code path.
+        {
+          const mockMatch = [null, '']; // match[1] = optional month input
+          const target = require('./lib/monthly-planning').parseTargetMonth(null);
+          const targetMonthStr = target.monthStr;
+
+          await bot.sendMessage(chatId, `📅 Generating monthly content plan for *${targetMonthStr}*...\nThis will take a moment.`, { parse_mode: 'Markdown' });
+
+          const systemPrompt = require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
+          const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
+
+          const rawResponse = await callOpenRouter([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ]);
+
+          const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
+          const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
+
+          if (!parsed.valid || parsed.posts.length < 12) {
+            const errorDetail = parsed.errors.length > 0
+              ? '\n' + parsed.errors.slice(0, 10).map(e => `• ${e}`).join('\n')
+              : '';
+            await bot.sendMessage(chatId,
+              `⚠️ The AI response did not produce a valid monthly plan.${errorDetail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
+            break;
+          }
+
+          let planId = null;
+          if (require('./lib/supabase').isConfigured()) {
+            try {
+              const planRow = await require('./lib/supabase-plans').createContentPlan({
+                month: targetMonthStr,
+                status: 'pending_approval',
+                chat_id: String(chatId),
+                total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
+                notes: `Generated via intent router`,
+              });
+              planId = planRow.id;
+            } catch (err) {
+              console.error('content_plans creation error:', err);
+              await bot.sendMessage(chatId, `⚠️ Monthly plan generated but could not save to database.`);
+            }
+          }
+
+          const createdCalendarIds = [];
+          if (planId && require('./lib/supabase').isConfigured()) {
+            for (const post of parsed.posts) {
+              try {
+                const dbPillar = mapPillarForDB(post.pillar);
+                const calRow = await require('./lib/supabase').createContentCalendar({
+                  chat_id: String(chatId),
+                  pillar: dbPillar,
+                  topic: post.topic,
+                  post_angle: post.post_angle,
+                  suggested_date: post.suggested_date,
+                  plan_id: planId,
+                  status: 'planned',
+                });
+                createdCalendarIds.push(calRow.id);
+              } catch (err) {
+                console.error('createContentCalendar error:', err.message);
+                createdCalendarIds.push(null);
+              }
+            }
+          }
+
+          const sortedPosts = [...parsed.posts].sort((a, b) => a.suggested_date.localeCompare(b.suggested_date));
+          const weeks = [];
+          let currentWeek = [];
+          let currentWeekNum = null;
+
+          for (const post of sortedPosts) {
+            const d = new Date(post.suggested_date + 'T00:00:00+08:00');
+            const startOfYear = new Date(d.getFullYear(), 0, 1);
+            const weekNum = Math.ceil((((d - startOfYear) / 86400000) + startOfYear.getDay() + 1) / 7);
+            if (currentWeekNum !== null && weekNum !== currentWeekNum) {
+              weeks.push(currentWeek);
+              currentWeek = [];
+            }
+            currentWeekNum = weekNum;
+            currentWeek.push(post);
+          }
+          if (currentWeek.length > 0) weeks.push(currentWeek);
+
+          let output = `📅 *Monthly Content Plan — ${targetMonthStr}*\n\n`;
+          output += `*Pillar Breakdown:*\n`;
+          for (const [p, count] of Object.entries(parsed.pillarCounts)) {
+            if (p === 'festival') continue;
+            output += `📝 ${p}: ${count}\n`;
+          }
+          if (parsed.festivalPosts.length > 0) {
+            output += `🎊 festival: ${parsed.festivalPosts.length}\n`;
+          }
+          output += `\n`;
+
+          for (const week of weeks) {
+            output += `━━━ *Week* ━━━\n`;
+            for (const post of week) {
+              const dateFormatted = post.suggested_date.replace(/^\d{4}-/, '');
+              output += `${dateFormatted} 📝 *${post.topic}*\n`;
+              output += `   _${post.pillar}_ — ${post.post_angle}\n\n`;
+            }
+          }
+          output += `✅ *${parsed.regularPosts.length} regular posts + ${parsed.festivalPosts.length} festival posts generated*`;
+
+          const keyboardRows = [];
+          if (planId && createdCalendarIds.length > 0) {
+            for (let i = 0; i < sortedPosts.length; i++) {
+              const post = sortedPosts[i];
+              const calId = createdCalendarIds[i];
+              if (!calId) continue;
+              const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
+              keyboardRows.push([
+                { text: `✏️ ${shortTopic}`, callback_data: `month_edit_topic:${planId}:${calId}` },
+                { text: `❌ Remove`, callback_data: `month_remove:${planId}:${calId}` },
+                { text: `🔄 Replace`, callback_data: `month_replace:${planId}:${calId}` },
+              ]);
+            }
+            keyboardRows.push(
+              [{ text: '✅ Approve this month', callback_data: `month_approve:${planId}` }]
+            );
+          }
+
+          await bot.sendMessage(chatId, output, {
+            parse_mode: 'Markdown',
+            reply_markup: planId ? { inline_keyboard: keyboardRows } : undefined,
+          });
+        }
+        break;
+
+      case 'generate_post':
+        // Generate content with detected pillar and topic
+        {
+          const pillar = classification.params && classification.params.pillar ? classification.params.pillar : 'product';
+          const topic = classification.params && classification.params.topic ? classification.params.topic : text;
+          await bot.sendMessage(chatId, `⏳ Generating ${pillar} post based on your request...`);
+          const content = await generateContent(pillar, topic);
+          await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
+        }
+        break;
+
+      case 'ask_question':
+        // Answer as marketing consultant
+        {
+          const answer = classification.response || 
+            (classification.params && classification.params.question 
+              ? `Great question about "${classification.params.question}"! Let me help with that.`
+              : 'Thanks for your question!');
+          await bot.sendMessage(chatId, answer);
+        }
+        break;
+
+      case 'unclear':
+      default:
+        // Ask clarifying question using the response field
+        await bot.sendMessage(chatId, classification.response || 
+          'I\'m not sure what you need. I can help with:\n\n📅 Monthly content planning\n✍️ Writing social media posts\n💡 Marketing advice & product questions\n\nWhat would you like?');
+        break;
+    }
   } catch (err) {
-    console.error('freetext error:', err);
-    await bot.sendMessage(chatId, userMessage(err, 'Error generating content. Please try again.'));
+    console.error('intent router error:', err);
+    await bot.sendMessage(chatId, userMessage(err, 'Sorry, I had trouble processing your message. Please try again or use a command like /product or /plan.'));
   }
 });
 
