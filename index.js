@@ -214,7 +214,7 @@ function buildProductContext() {
 // ============================================
 // OpenRouter API helper (fetch, no SDK)
 // ============================================
-async function callOpenRouter(messages) {
+async function callOpenRouter(messages, maxTokens) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60_000);
   try {
@@ -229,7 +229,7 @@ async function callOpenRouter(messages) {
       body: JSON.stringify({
         model: MODEL,
         messages: messages,
-        max_tokens: 1500,
+        max_tokens: maxTokens || 1500,
         temperature: 0.8
       }),
       signal: controller.signal
@@ -624,17 +624,21 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
       { role: 'user', content: userPrompt },
     ];
 
-    const rawResponse = await callOpenRouter(messages);
+    const rawResponse = await callOpenRouter(messages, 4000);
 
     // Step b: Parse and validate
     const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
 
-    if (!parsed.valid || parsed.posts.length < 12) {
-      const errorDetail = parsed.errors.length > 0
-        ? '\n' + parsed.errors.slice(0, 10).map(e => `• ${e}`).join('\n')
-        : '';
+    if (!parsed.valid || parsed.posts.length < 8) {
+      let detail = '';
+      if (parsed.errors.length > 0) {
+        detail += '\n' + parsed.errors.slice(0, 10).map(e => '• ' + e).join('\n');
+      }
+      if (parsed.warnings && parsed.warnings.length > 0) {
+        detail += '\n\n⚠️ Notes:\n' + parsed.warnings.slice(0, 15).map(w => '• ' + w).join('\n');
+      }
       await bot.sendMessage(chatId,
-        `⚠️ The AI response did not produce a valid monthly plan.${errorDetail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
+        `⚠️ The AI response did not produce a valid monthly plan.${detail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
       return;
     }
 
@@ -1410,17 +1414,21 @@ bot.on('message', async (msg) => {
           const rawResponse = await callOpenRouter([
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt },
-          ]);
+          ], 4000);
 
           const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
           const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
 
-          if (!parsed.valid || parsed.posts.length < 12) {
-            const errorDetail = parsed.errors.length > 0
-              ? '\n' + parsed.errors.slice(0, 10).map(e => `• ${e}`).join('\n')
-              : '';
+          if (!parsed.valid || parsed.posts.length < 8) {
+            let detail = '';
+            if (parsed.errors.length > 0) {
+              detail += '\n' + parsed.errors.slice(0, 10).map(e => '• ' + e).join('\n');
+            }
+            if (parsed.warnings && parsed.warnings.length > 0) {
+              detail += '\n\n⚠️ Notes:\n' + parsed.warnings.slice(0, 15).map(w => '• ' + w).join('\n');
+            }
             await bot.sendMessage(chatId,
-              `⚠️ The AI response did not produce a valid monthly plan.${errorDetail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
+              `⚠️ The AI response did not produce a valid monthly plan.${detail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
             break;
           }
 

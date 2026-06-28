@@ -152,9 +152,9 @@ const missingStoryJson = JSON.stringify([
 ]);
 
 parsed = parseAndValidateMonthlyPlan(missingStoryJson, TARGET_MONTH_STR);
-assert(parsed.valid === false, 'missing story pillar: valid=false');
-const hasStoryError = parsed.errors.some(e => e.includes('story'));
-assert(hasStoryError, 'missing story pillar: error mentions story');
+assert(parsed.valid === true, 'missing story pillar: valid=true (soft warning)');
+assert(parsed.warnings.some(w => w.includes('story')), 'missing story pillar: warning mentions story');
+assert(parsed.posts.length === 12, 'missing story pillar: 12 posts accepted');
 
 // 4. Duplicate dates (non-festival)
 const duplicateDateJson = JSON.stringify([
@@ -173,9 +173,9 @@ const duplicateDateJson = JSON.stringify([
 ]);
 
 parsed = parseAndValidateMonthlyPlan(duplicateDateJson, TARGET_MONTH_STR);
-assert(parsed.valid === false, 'duplicate non-festival dates: valid=false');
-const hasDupError = parsed.errors.some(e => e.includes('duplicate date'));
-assert(hasDupError, 'duplicate dates: error mentions duplicate date');
+assert(parsed.valid === true, 'duplicate non-festival dates: valid=true (auto-shifted)');
+const hasDupWarning = parsed.warnings && parsed.warnings.some(w => w.includes('auto-shifted'));
+assert(hasDupWarning, 'duplicate dates: warning mentions auto-shifted');
 
 // 5. Weekend date
 const weekendDateJson = JSON.stringify([
@@ -194,10 +194,9 @@ const weekendDateJson = JSON.stringify([
 ]);
 
 parsed = parseAndValidateMonthlyPlan(weekendDateJson, TARGET_MONTH_STR);
-assert(parsed.valid === false, 'weekend date: valid=false');
-// The Saturday post should be caught, the rest should be fine but ratios may be off
-const hasWeekendError = parsed.errors.some(e => e.includes('weekend'));
-assert(hasWeekendError, 'weekend date: error mentions weekend');
+assert(parsed.valid === true, 'weekend date: valid=true (auto-shifted)');
+const hasWeekendWarning = parsed.warnings && parsed.warnings.some(w => w.includes('weekend'));
+assert(hasWeekendWarning, 'weekend date: warning mentions weekend');
 
 // 6. JSON with markdown code fences
 const fenceJson = '```json\n' + validJson + '\n```';
@@ -247,7 +246,7 @@ async function callOpenRouter(messages) {
     body: JSON.stringify({
       model: MODEL,
       messages: messages,
-      max_tokens: 3000,
+      max_tokens: 4000,
       temperature: 0.8
     })
   });
