@@ -831,69 +831,76 @@ bot.onText(/^\/check_today/i, async (msg) => {
 // ============================================
 // M-3: /generate_content — Batch copy generation
 // ============================================
-bot.onText(/^\/generate_content\s+(.+)/is, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const planId = match[1].trim();
 
+/**
+ * Shared batch content generation logic.
+ * Called both by the /generate_content command and auto-triggered after M-2 month approval.
+ */
+async function batchGenerateContent(chatId, planId) {
   if (!supabase.isConfigured()) {
     await bot.sendMessage(chatId, '⚠️ Supabase not configured. Cannot generate content.');
     return;
   }
 
+  const allRows = await supabase.listContentCalendarByPlanId(planId);
+  const approvedRows = allRows.filter(r => r.status === 'plan_approved');
+
+  if (approvedRows.length === 0) {
+    await bot.sendMessage(chatId, '⚠️ No posts with "plan_approved" status found for this plan. Approve the plan first with ✅ Approve this month.');
+    return;
+  }
+
+  const total = approvedRows.length;
+  let successCount = 0;
+  let failCount = 0;
+  const results = [];
+
+  await bot.sendMessage(chatId, `⏳ Generating content for ${total} posts... This will take a moment.`);
+
+  for (let i = 0; i < approvedRows.length; i++) {
+    const row = approvedRows[i];
+    try {
+      const prompt = buildCopywritingPrompt(row.topic, row.pillar);
+      const raw = await callOpenRouter([
+        { role: 'system', content: prompt },
+        { role: 'user', content: `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.` },
+      ]);
+      const parsed = parseCopywritingResponse(raw);
+      if (!parsed) throw new Error('Failed to parse copywriting response');
+
+      const validation = validateCopywritingResult(parsed);
+      if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
+
+      await supabase.updateContentCalendar(row.id, {
+        fb_content: parsed.fb_content,
+        ig_content: parsed.ig_content,
+        hashtags: parsed.hashtags,
+        status: 'copy_done',
+      });
+      successCount++;
+      results.push({ id: row.id, topic: row.topic, success: true });
+      await bot.sendMessage(chatId, `✅ ${i+1}/${total}: ${row.topic}`);
+    } catch (err) {
+      console.error(`batchGenerateContent: row ${row.id} failed:`, err.message);
+      failCount++;
+      results.push({ id: row.id, topic: row.topic, success: false, error: err.message });
+      await bot.sendMessage(chatId, `❌ ${i+1}/${total}: ${row.topic} — Generation failed.`);
+    }
+  }
+
+  // Summary
+  const summary = successCount > 0
+    ? `✅ *Generation Complete!* ${successCount}/${total} posts generated, ${failCount} failed.\n\nUse /review_content ${planId} to review all generated content.`
+    : `❌ *Generation Failed.* All ${total} posts failed. Please check the errors above and try again.`;
+
+  await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
+}
+
+bot.onText(/^\/generate_content\s+(.+)/is, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const planId = match[1].trim();
   try {
-    // Find all rows with status='plan_approved'
-    const allRows = await supabase.listContentCalendarByPlanId(planId);
-    const approvedRows = allRows.filter(r => r.status === 'plan_approved');
-
-    if (approvedRows.length === 0) {
-      await bot.sendMessage(chatId, '⚠️ No posts with "plan_approved" status found for this plan. Approve the plan first with ✅ Approve this month.');
-      return;
-    }
-
-    const total = approvedRows.length;
-    let successCount = 0;
-    let failCount = 0;
-    const results = [];
-
-    await bot.sendMessage(chatId, `⏳ Generating content for ${total} posts... This will take a moment.`);
-
-    for (let i = 0; i < approvedRows.length; i++) {
-      const row = approvedRows[i];
-      try {
-        const prompt = buildCopywritingPrompt(row.topic, row.pillar);
-        const raw = await callOpenRouter([
-          { role: 'system', content: prompt },
-          { role: 'user', content: `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.` },
-        ]);
-        const parsed = parseCopywritingResponse(raw);
-        if (!parsed) throw new Error('Failed to parse copywriting response');
-
-        const validation = validateCopywritingResult(parsed);
-        if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
-
-        await supabase.updateContentCalendar(row.id, {
-          fb_content: parsed.fb_content,
-          ig_content: parsed.ig_content,
-          hashtags: parsed.hashtags,
-          status: 'copy_done',
-        });
-        successCount++;
-        results.push({ id: row.id, topic: row.topic, success: true });
-        await bot.sendMessage(chatId, `✅ ${i+1}/${total}: ${row.topic}`);
-      } catch (err) {
-        console.error(`generate_content: row ${row.id} failed:`, err.message);
-        failCount++;
-        results.push({ id: row.id, topic: row.topic, success: false, error: err.message });
-        await bot.sendMessage(chatId, `❌ ${i+1}/${total}: ${row.topic} — Generation failed.`);
-      }
-    }
-
-    // Summary
-    const summary = successCount > 0
-      ? `✅ *Generation Complete!* ${successCount}/${total} posts generated, ${failCount} failed.\n\nUse /review_content ${planId} to review all generated content.`
-      : `❌ *Generation Failed.* All ${total} posts failed. Please check the errors above and try again.`;
-
-    await bot.sendMessage(chatId, summary, { parse_mode: 'Markdown' });
+    await batchGenerateContent(chatId, planId);
   } catch (err) {
     console.error('/generate_content error:', err);
     await bot.sendMessage(chatId, userMessage(err, 'Error generating batch content. Please try again.'));
@@ -1788,17 +1795,20 @@ bot.on('callback_query', async (cb) => {
         }
       }
 
-      await bot.answerCallbackQuery(cb.id, { text: '✅ Monthly plan approved!' });
+      await bot.answerCallbackQuery(cb.id, { text: '✅ Monthly plan approved! Generating content...' });
       const originalText = (message && message.text) || '';
       const statusLine = failedCount > 0
-        ? `\n\n✅ *Plan Approved!* ${successCount} posts approved, ${failedCount} failed. Proceeding to content creation.`
-        : `\n\n✅ *Plan Approved!* All ${successCount} posts approved. Proceeding to content creation.`;
+        ? `\n\n✅ *Plan Approved!* ${successCount} posts approved, ${failedCount} failed. Starting batch content generation...`
+        : `\n\n✅ *Plan Approved!* All ${successCount} posts approved. Starting batch content generation...`;
       await bot.editMessageText(originalText + statusLine, {
         chat_id: chatId,
         message_id: messageId,
         parse_mode: 'Markdown',
         reply_markup: { inline_keyboard: [] },
       });
+
+      // Auto-trigger M-3: batch content generation for all approved posts
+      await batchGenerateContent(chatId, planId);
     } catch (err) {
       console.error('month_approve callback error:', err);
       try {
