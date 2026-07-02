@@ -87,6 +87,32 @@ if (supabase.isConfigured()) {
 }
 
 // ============================================
+// callback_data constructor with byte-size guard
+// Telegram limit: 64 bytes. We assert <= 60 for margin.
+// ============================================
+/**
+ * Build safe callback_data with automatic byte-size assertion.
+ * Throws immediately at construction time if data exceeds 60 bytes,
+ * so overflows are caught during dev, not at sendMessage() runtime.
+ *
+ * @param {string} prefix - short prefix (2-4 chars recommended for headroom)
+ * @param  {...(string|number)} parts - additional segments joined with ':'
+ * @returns {string} callback_data (< 60 bytes guaranteed)
+ */
+function cb(prefix, ...parts) {
+  const data = parts.length > 0 ? `${prefix}:${parts.join(':')}` : prefix;
+  const bytes = Buffer.byteLength(data, 'utf8');
+  if (bytes > 60) {
+    throw new Error(
+      `callback_data overflow: "${data}" = ${bytes} bytes ` +
+      `(Telegram limit 64, margin kept to 60). ` +
+      `Shorten prefix or use a Map lookup instead.`
+    );
+  }
+  return data;
+}
+
+// ============================================
 // /plan session state
 // ============================================
 // Map<chatId, { plans: [{number, title, description, direction}], timestamp: Date }>
@@ -160,8 +186,8 @@ function buildReviewKeyboard(rowId) {
   return {
     inline_keyboard: [
       [
-        { text: '✅ Approve', callback_data: `review_approve:${rowId}` },
-        { text: '✏️ Request Changes', callback_data: `review_reject:${rowId}` },
+        { text: '✅ Approve', callback_data: cb('review_approve',rowId) },
+        { text: '✏️ Request Changes', callback_data: cb('review_reject',rowId) },
       ],
     ],
   };
@@ -578,13 +604,13 @@ async function buildMonthCalendarMessage(planId) {
       : (row.topic || '');
     monthActionMap.set(row.id, planId);
     keyboard.push([
-      { text: `✏️ ${shortTopic}`, callback_data: `me:${row.id}` },
-      { text: `❌ Remove`, callback_data: `mr:${row.id}` },
-      { text: `🔄 Replace`, callback_data: `mrp:${row.id}` },
+      { text: `✏️ ${shortTopic}`, callback_data: cb('me',row.id) },
+      { text: `❌ Remove`, callback_data: cb('mr',row.id) },
+      { text: `🔄 Replace`, callback_data: cb('mrp',row.id) },
     ]);
   }
   keyboard.push(
-    [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
+    [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
   );
 
   return { text: output, keyboard: { inline_keyboard: keyboard } };
@@ -748,13 +774,13 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
         const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
         monthActionMap.set(calId, planId);
         keyboardRows.push([
-          { text: `✏️ ${shortTopic}`, callback_data: `me:${calId}` },
-          { text: `❌ Remove`, callback_data: `mr:${calId}` },
-          { text: `🔄 Replace`, callback_data: `mrp:${calId}` },
+          { text: `✏️ ${shortTopic}`, callback_data: cb('me',calId) },
+          { text: `❌ Remove`, callback_data: cb('mr',calId) },
+          { text: `🔄 Replace`, callback_data: cb('mrp',calId) },
         ]);
       }
       keyboardRows.push(
-        [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
+        [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
       );
     }
 
@@ -955,19 +981,19 @@ async function sendBatchReviewMessage(chatId, planId) {
     const label = `${statusBadge} ${shortTopic}`;
 
     if (row.status === 'copy_approved') {
-      keyboard.push([{ text: `✅ ${shortTopic} — Approved`, callback_data: `bn:${row.id}` }]);
+      keyboard.push([{ text: `✅ ${shortTopic} — Approved`, callback_data: cb('bn',row.id) }]);
     } else {
       // Store planId in batchActionMap so callback_data stays under 64-byte limit
       batchActionMap.set(row.id, planId);
       keyboard.push([
-        { text: `✅ Approve: ${shortTopic}`, callback_data: `ba:${row.id}` },
-        { text: `✏️ Reject`, callback_data: `br:${row.id}` },
+        { text: `✅ Approve: ${shortTopic}`, callback_data: cb('ba',row.id) },
+        { text: `✏️ Reject`, callback_data: cb('br',row.id) },
       ]);
     }
   }
 
   if (pending > 0) {
-    keyboard.push([{ text: `✅ Approve All Remaining (${pending})`, callback_data: `baa:${planId}` }]);
+    keyboard.push([{ text: `✅ Approve All Remaining (${pending})`, callback_data: cb('baa',planId) }]);
   }
 
   // Split message if too long
@@ -1172,7 +1198,7 @@ bot.on('message', async (msg) => {
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: '🔄 Regenerate with Feedback', callback_data: `redo_copy:${rowId}` }],
+              [{ text: '🔄 Regenerate with Feedback', callback_data: cb('redo_copy',rowId) }],
             ],
           },
         }
@@ -1200,7 +1226,7 @@ bot.on('message', async (msg) => {
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: '🔄 Regenerate with Feedback', callback_data: `brg:${rowId}` }],
+              [{ text: '🔄 Regenerate with Feedback', callback_data: cb('brg',rowId) }],
             ],
           },
         }
@@ -1379,7 +1405,7 @@ bot.on('message', async (msg) => {
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
+              [{ text: '🚀 Publish', callback_data: cb('publish_go',rowId) }],
             ],
           },
         }
@@ -1530,13 +1556,13 @@ bot.on('message', async (msg) => {
               const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
               monthActionMap.set(calId, planId);
               keyboardRows.push([
-                { text: `✏️ ${shortTopic}`, callback_data: `me:${calId}` },
-                { text: `❌ Remove`, callback_data: `mr:${calId}` },
-                { text: `🔄 Replace`, callback_data: `mrp:${calId}` },
+                { text: `✏️ ${shortTopic}`, callback_data: cb('me',calId) },
+                { text: `❌ Remove`, callback_data: cb('mr',calId) },
+                { text: `🔄 Replace`, callback_data: cb('mrp',calId) },
               ]);
             }
             keyboardRows.push(
-              [{ text: '✅ Approve this month', callback_data: `ma:${planId}` }]
+              [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
             );
           }
 
@@ -2027,7 +2053,7 @@ Requirements:
         message_id: messageId,
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
+            [{ text: '🚀 Publish', callback_data: cb('publish_go',rowId) }],
           ],
         },
       });
@@ -2059,8 +2085,8 @@ Requirements:
           reply_markup: {
             inline_keyboard: [
               [
-                { text: '🔄 Regenerate', callback_data: `image_retry_go:${rowId}:${nextCount}` },
-                { text: '⏭️ Skip Image', callback_data: `image_skip:${rowId}` },
+                { text: '🔄 Regenerate', callback_data: cb('image_retry_go',rowId,nextCount) },
+                { text: '⏭️ Skip Image', callback_data: cb('image_skip',rowId) },
               ],
             ],
           },
@@ -2123,7 +2149,7 @@ Requirements:
         message_id: messageId,
         reply_markup: {
           inline_keyboard: [
-            [{ text: '🚀 Publish', callback_data: `publish_go:${rowId}` }],
+            [{ text: '🚀 Publish', callback_data: cb('publish_go',rowId) }],
           ],
         },
       });
@@ -2531,16 +2557,16 @@ async function sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, re
   const keyboard = {
     inline_keyboard: [
       [
-        { text: '✅ Approve', callback_data: `image_approve:${rowId}` },
-        { text: '✏️ Regenerate', callback_data: `image_retry:${rowId}:${count}` },
+        { text: '✅ Approve', callback_data: cb('image_approve',rowId) },
+        { text: '✏️ Regenerate', callback_data: cb('image_retry',rowId,count) },
       ],
       [
-        { text: '🎬 Change Scene', callback_data: `image_change_scene:${rowId}:${count}` },
-        { text: '🖼️ Change Product', callback_data: `image_change_product:${rowId}:${count}` },
+        { text: '🎬 Change Scene', callback_data: cb('image_change_scene',rowId,count) },
+        { text: '🖼️ Change Product', callback_data: cb('image_change_product',rowId,count) },
       ],
       [
-        { text: '📤 Upload Own', callback_data: `image_upload_own:${rowId}` },
-        { text: '⏭️ Skip Image', callback_data: `image_skip:${rowId}` },
+        { text: '📤 Upload Own', callback_data: cb('image_upload_own',rowId) },
+        { text: '⏭️ Skip Image', callback_data: cb('image_skip',rowId) },
       ],
     ],
   };
@@ -2581,8 +2607,8 @@ async function sendTechnicalFailureNotice(chatId, rowId) {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: '🔄 Retry', callback_data: `image_retry_go:${rowId}:0` },
-          { text: '⏭️ Skip Image', callback_data: `image_skip:${rowId}` },
+          { text: '🔄 Retry', callback_data: cb('image_retry_go',rowId,0) },
+          { text: '⏭️ Skip Image', callback_data: cb('image_skip',rowId) },
         ],
       ],
     },
