@@ -4,3 +4,8 @@ node_modules/
 .DS_Store
 *.log
 version.txt
+
+# test artifacts
+assets/scenes/DRYRUN-*
+assets/scenes/scene-*
+assets/scenes/overlays/
