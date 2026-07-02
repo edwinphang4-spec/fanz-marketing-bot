@@ -7,3 +7,5 @@ version.txt
 
 # test artifacts
 assets/scenes/DRYRUN-*
+assets/scenes/scene-*
+assets/scenes/overlays/
