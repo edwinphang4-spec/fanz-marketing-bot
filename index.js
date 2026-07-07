@@ -8,7 +8,6 @@ const supabasePlans = require('./lib/supabase-plans');
 const { buildPlanSystemPrompt, parsePlanResponse, validateSelection, createSelectionPayload } = require('./lib/planning');
 const { buildCopywritingPrompt, parseCopywritingResponse, validateCopywritingResult } = require('./lib/copywriting');
 const { publishToSocial } = require('./lib/publish');
-const { generateSceneImage } = require('./lib/scene-gen');
 const { buildMonthlySystemPrompt, parseTargetMonth } = require('./lib/monthly-planning');
 const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
@@ -1357,23 +1356,15 @@ bot.on('message', async (msg) => {
         return;
       }
 
-      // Call scene-gen with the custom scene description injected
-      const { generateSceneImage } = require('./lib/scene-gen');
-      const { PRODUCTS_DIR, selectProductImage, writeSourceProductImage } = require('./lib/select-product');
-
-      const sourceImage = row.source_product_image || null;
-      const customTopic = `${row.topic || ''} — ${newScene}`;
-
-      const result = await generateSceneImage(
-        rowId,
-        customTopic,
-        row.pillar || 'product',
-        sourceImage,
-        PRODUCTS_DIR
-      );
+      // 合成版管线：newScene 作为场景提示重新生成背景并重合成
+      const { runImageryPipeline } = require('./lib/pipeline');
+      const result = await runImageryPipeline(rowId, {
+        topicOverride: newScene,
+        fresh: true,
+      });
 
       if (result.success) {
-        await sendImageReviewCard(chatId, rowId, result.sceneImageUrl || '(scene)', 'generated', result.dryRun);
+        await sendImageReviewCard(chatId, rowId, result.imageUrl || '(scene)', 'generated', result.isDryRun);
       } else {
         await sendTechnicalFailureNotice(chatId, rowId);
       }
@@ -1760,21 +1751,13 @@ bot.on('callback_query', async (cb) => {
           if (isFestivalPost(row)) {
             const festiveScene = getFestiveSceneDescription(row);
             console.log(`Festival post detected for row ${rowId}: "${festiveScene}" — using festive design`);
-            // Use scene-gen directly with the festive scene as the topic
-            const { generateSceneImage } = require('./lib/scene-gen');
-            const { PRODUCTS_DIR } = require('./lib/select-product');
-
-            const sourceImage = row.source_product_image || null;
-            generateSceneImage(
-              rowId,
-              festiveScene,
-              'story',
-              sourceImage,
-              PRODUCTS_DIR
-            ).then(async (sceneResult) => {
+            // 合成版管线：节庆场景作为场景提示。旧路径只出场景图、不叠字
+            // 不入库（缺口），统一走完整管线顺带补上。
+            const { runImageryPipeline } = require('./lib/pipeline');
+            runImageryPipeline(rowId, { topicOverride: festiveScene }).then(async (sceneResult) => {
               if (sceneResult.success) {
-                console.log(`festival imagery: success for row ${rowId} — ${sceneResult.sceneImageUrl}`);
-                await sendImageReviewCard(chatId, rowId, sceneResult.sceneImageUrl || '(festive)', 'generated', sceneResult.dryRun);
+                console.log(`festival imagery: success for row ${rowId} — ${sceneResult.imageUrl}`);
+                await sendImageReviewCard(chatId, rowId, sceneResult.imageUrl || '(festive)', 'generated', sceneResult.isDryRun);
               } else {
                 console.error(`festival imagery: failed for row ${rowId} — ${sceneResult.error}`);
                 await sendTechnicalFailureNotice(chatId, rowId);
