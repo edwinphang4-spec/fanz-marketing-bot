@@ -353,6 +353,8 @@ if (!SKIP_BOT_INIT) {
     sendPhoto: (chatId, photo, opts) => bot.sendPhoto(chatId, photo, opts),
     sendImageReviewCard: (chatId, rowId, imageUrl, status, isDryRun, retryCount) =>
       sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, retryCount),
+    sendVideoReviewCard: (chatId, rowId, videoUrl, topic) =>
+      sendVideoReviewCard(chatId, rowId, videoUrl, topic),
   });
 }
 
@@ -2221,6 +2223,47 @@ Requirements:
   // ============================================
 
   // image_approve:rowId — approve imagery, move to 'approved' (all gates passed)
+  // ── 每周动态视频审核 ──
+  if (data.startsWith('video_approve:')) {
+    const rowId = data.slice('video_approve:'.length);
+    try {
+      await worker.resolveVideoReview(rowId, true);
+      await bot.answerCallbackQuery(cb.id, { text: '✅ Video approved for this post.' });
+      const cap = (message && message.caption) || (message && message.text) || '🎬 Weekly Video';
+      try {
+        if (message && message.caption) {
+          await bot.editMessageCaption(cap + '\n\n✅ Video approved.', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } });
+        } else {
+          await bot.editMessageText(cap + '\n\n✅ Video approved.', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } });
+        }
+      } catch (_) {}
+    } catch (err) {
+      console.error('video_approve callback error:', err);
+      try { await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' }); } catch (_) {}
+    }
+    return;
+  }
+
+  if (data.startsWith('video_reject:')) {
+    const rowId = data.slice('video_reject:'.length);
+    try {
+      await worker.resolveVideoReview(rowId, false); // 清掉视频，下一轮 worker 重新生成一版
+      await bot.answerCallbackQuery(cb.id, { text: '🔁 Will regenerate a new video version.' });
+      const cap = (message && message.caption) || (message && message.text) || '🎬 Weekly Video';
+      try {
+        if (message && message.caption) {
+          await bot.editMessageCaption(cap + '\n\n🔁 Rejected — regenerating a new version shortly.', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } });
+        } else {
+          await bot.editMessageText(cap + '\n\n🔁 Rejected — regenerating a new version shortly.', { chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } });
+        }
+      } catch (_) {}
+    } catch (err) {
+      console.error('video_reject callback error:', err);
+      try { await bot.answerCallbackQuery(cb.id, { text: 'Operation failed. Please try again.' }); } catch (_) {}
+    }
+    return;
+  }
+
   if (data.startsWith('image_approve:')) {
     const rowId = data.slice('image_approve:'.length);
     try {
@@ -2819,6 +2862,30 @@ async function sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, re
         { parse_mode: 'Markdown', reply_markup: keyboard }
       );
     }
+  }
+}
+
+/**
+ * Send the weekly dynamic-video review card (method B output) to Telegram.
+ * Approve → video_status='approved'; Reject → regenerate next tick.
+ */
+async function sendVideoReviewCard(chatId, rowId, videoUrl, topic) {
+  const caption =
+    `🎬 *Weekly Video Review*\n"${topic || ''}"\n\nApprove this dynamic version for the post?`;
+  const keyboard = {
+    inline_keyboard: [[
+      { text: '✅ Approve', callback_data: cb('video_approve', rowId) },
+      { text: '🔁 Regenerate', callback_data: cb('video_reject', rowId) },
+    ]],
+  };
+  try {
+    await bot.sendVideo(chatId, videoUrl, { caption, parse_mode: 'Markdown', reply_markup: keyboard });
+  } catch (videoErr) {
+    // sendVideo 失败（URL 不可达 / 格式）→ 退回带链接的文本
+    console.error('sendVideo failed, falling back to text:', videoErr.message);
+    await bot.sendMessage(chatId,
+      `🎬 *Weekly Video Review*\n"${topic || ''}"\n\nVideo: ${videoUrl}\n\nApprove this dynamic version?`,
+      { parse_mode: 'Markdown', reply_markup: keyboard });
   }
 }
 
