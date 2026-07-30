@@ -682,7 +682,7 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
 
   try {
     // Step a: Build prompt and call LLM
-    const systemPrompt = buildMonthlySystemPrompt(targetMonthStr);
+    const systemPrompt = await buildMonthlySystemPrompt(targetMonthStr);
     const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
 
     const messages = [
@@ -1589,7 +1589,7 @@ bot.on('message', async (msg) => {
 
           await bot.sendMessage(chatId, `📅 Generating monthly content plan for *${targetMonthStr}*...\nThis will take a moment.`, { parse_mode: 'Markdown' });
 
-          const systemPrompt = require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
+          const systemPrompt = await require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
           const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
 
           const rawResponse = await callOpenRouter([
