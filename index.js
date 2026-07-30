@@ -15,7 +15,7 @@ async function brandVoice() {
   try { return (await brandKitData.getBrandKit()).brand_voice || null; } catch { return null; }
 }
 const { buildMonthlySystemPrompt, parseTargetMonth } = require('./lib/monthly-planning');
-const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
+const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
 const { schedulePlan, formatScheduleTable } = require('./lib/monthly-scheduler');
 const { checkTodayPosts, buildReminderMessage } = require('./cron-publish-reminder');
@@ -708,6 +708,17 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
       return;
     }
 
+    // 解析器判掉/调整了哪些帖子 —— 存进 plan notes 并告知,别只在整体失效时才说。
+    // (2026-07-30:批量只出 11 篇而事后查不出原因,就是因为这段警告被丢掉了)
+    const planIssues = summarizePlanIssues(parsed, 13);
+    if (planIssues.summary) {
+      console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues.summary}`);
+      try {
+        await bot.sendMessage(chatId,
+          `ℹ️ Plan notes for ${targetMonthStr}:\n${planIssues.summary.slice(0, 1500)}`);
+      } catch (_) {}
+    }
+
     // Step c: Create content_plans row
     let planId = null;
     if (supabase.isConfigured()) {
@@ -717,7 +728,8 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
           status: 'pending_approval',
           chat_id: String(chatId),
           total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
-          notes: `Generated via /plan_month`,
+          notes: `Generated via /plan_month` +
+            (planIssues.summary ? `\n\n[parser notes]\n${planIssues.summary}` : ''),
         });
         planId = planRow.id;
         console.log(`Created content_plans row: ${planId} for ${targetMonthStr}`);
@@ -732,10 +744,20 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
     // Step d: Create content_calendar rows linked to plan
     const createdCalendarIds = [];
     if (planId && supabase.isConfigured()) {
-      for (const post of parsed.posts) {
+      // 规划时就把产品定下来（Edwin 三步方案第三步）：按素材库选品池匹配
+      // 标题里的系列/尺寸/颜色/有无灯/房间，并保证整月轮换不重复。
+      // 不定的话每一行都会掉进 pipeline 兜底，整月配图跟标题对不上。
+      let productPicks = [];
+      try {
+        productPicks = await require('./lib/pick-product').pickProductsForPlan(parsed.posts);
+      } catch (err) {
+        console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
+      }
+      for (const [postIndex, post] of parsed.posts.entries()) {
         try {
           // Use DB-safe pillar (festival → story)
           const dbPillar = mapPillarForDB(post.pillar);
+          const pick = productPicks[postIndex] || null;
           const calRow = await supabase.createContentCalendar({
             chat_id: String(chatId),
             pillar: dbPillar,
@@ -744,6 +766,7 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
             suggested_date: post.suggested_date,
             plan_id: planId,
             status: 'planned',
+            ...(pick ? { source_product_image: pick.name } : {}),
           });
           createdCalendarIds.push(calRow.id);
         } catch (err) {
@@ -930,7 +953,12 @@ async function batchGenerateContent(chatId, planId) {
   for (let i = 0; i < approvedRows.length; i++) {
     const row = approvedRows[i];
     try {
-      const prompt = buildCopywritingPrompt(row.topic, row.pillar, undefined, await brandVoice());
+      // 把素材库现货 + 本篇已定型号喂给文案 —— 否则文案会写出库里没有的型号,
+      // 再被提炼成图上标题(实测出现过"标题 36 吋 AURA / 画面 FS 563L")
+      const prompt = buildCopywritingPrompt(
+        row.topic, row.pillar, undefined, await brandVoice(),
+        await require('./lib/pick-product').copywritingProductContext(row)
+      );
       const raw = await callOpenRouter([
         { role: 'system', content: prompt },
         { role: 'user', content: `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.` },
@@ -1597,7 +1625,7 @@ bot.on('message', async (msg) => {
             { role: 'user', content: userPrompt },
           ], 4000);
 
-          const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
+          const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
           const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
 
           if (!parsed.valid || parsed.posts.length < 8) {
@@ -1613,6 +1641,16 @@ bot.on('message', async (msg) => {
             break;
           }
 
+          // 同上:有效但掉了帖子也要留痕(见 /plan_month 那处注释)
+          const planIssues2 = summarizePlanIssues(parsed, 13);
+          if (planIssues2.summary) {
+            console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues2.summary}`);
+            try {
+              await bot.sendMessage(chatId,
+                `ℹ️ Plan notes for ${targetMonthStr}:\n${planIssues2.summary.slice(0, 1500)}`);
+            } catch (_) {}
+          }
+
           let planId = null;
           if (require('./lib/supabase').isConfigured()) {
             try {
@@ -1621,7 +1659,8 @@ bot.on('message', async (msg) => {
                 status: 'pending_approval',
                 chat_id: String(chatId),
                 total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
-                notes: `Generated via intent router`,
+                notes: `Generated via intent router` +
+                  (planIssues2.summary ? `\n\n[parser notes]\n${planIssues2.summary}` : ''),
               });
               planId = planRow.id;
             } catch (err) {
@@ -1632,9 +1671,17 @@ bot.on('message', async (msg) => {
 
           const createdCalendarIds = [];
           if (planId && require('./lib/supabase').isConfigured()) {
-            for (const post of parsed.posts) {
+            // 同上:规划时按素材库选品池定产品(见另一处 /plan_month 的注释)
+            let productPicks = [];
+            try {
+              productPicks = await require('./lib/pick-product').pickProductsForPlan(parsed.posts);
+            } catch (err) {
+              console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
+            }
+            for (const [postIndex, post] of parsed.posts.entries()) {
               try {
                 const dbPillar = mapPillarForDB(post.pillar);
+                const pick = productPicks[postIndex] || null;
                 const calRow = await require('./lib/supabase').createContentCalendar({
                   chat_id: String(chatId),
                   pillar: dbPillar,
@@ -1643,6 +1690,7 @@ bot.on('message', async (msg) => {
                   suggested_date: post.suggested_date,
                   plan_id: planId,
                   status: 'planned',
+                  ...(pick ? { source_product_image: pick.name } : {}),
                 });
                 createdCalendarIds.push(calRow.id);
               } catch (err) {

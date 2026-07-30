@@ -38,8 +38,12 @@ async function makeBackground() {
 (async () => {
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const bg = await makeBackground();
-  const svgProduct = path.join(__dirname, 'assets', 'products', 'grande-l.svg');
+  // 2026-07-30:assets/products 里 5 个 SVG 全是白底(第二行就是整块 white rect),
+  // 没有真透明通道。旧测试拿它们跑合成"8/8 通过",实际产出的是没有产品的图——
+  // 静默跳过掩护了假绿测试。现在合成用例一律用真透明素材,白底素材专测守卫。
+  const opaqueProduct = path.join(__dirname, 'assets', 'products', 'grande-l.svg');
   const pngProduct = path.join(__dirname, 'assets', 'products', 'fanz-product-test.png');
+  const svgProduct = pngProduct; // 合成用例改用真透明素材
 
   // Case 1: SVG product + full texts, default slots
   const out1 = path.join(OUT_DIR, 'case1-svg-full.png');
@@ -91,6 +95,19 @@ async function makeBackground() {
     outPath: out5,
   });
   t(fs.existsSync(out5), 'case5: bad slot names fall back to defaults');
+
+  // Case 5b(2026-07-30 新增守卫): 白底/无 alpha 的产品图必须硬失败,
+  // 不许再安静地产出一张没有风扇的图。
+  let opaqueRejected = false, opaqueMsg = '';
+  try {
+    await composeFinal({
+      background: bg, productPath: opaqueProduct,
+      texts: { title: 'Should not render' },
+      outPath: path.join(OUT_DIR, 'case5b-opaque-should-fail.png'),
+    });
+  } catch (err) { opaqueRejected = true; opaqueMsg = err.message; }
+  t(opaqueRejected, 'case5b: opaque product image is rejected loudly, not silently skipped');
+  t(/no real transparency/.test(opaqueMsg), 'case5b: error message names the real cause');
 
   // Case 6: brand kit sanity — logo file exists, presets well-formed
   t(fs.existsSync(brandKit.LOGO.file), 'brand kit: logo file present');
