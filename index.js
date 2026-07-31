@@ -955,16 +955,36 @@ async function batchGenerateContent(chatId, planId) {
     try {
       // 把素材库现货 + 本篇已定型号喂给文案 —— 否则文案会写出库里没有的型号,
       // 再被提炼成图上标题(实测出现过"标题 36 吋 AURA / 画面 FS 563L")
+      const productCtx = await require('./lib/pick-product').copywritingProductContext(row);
       const prompt = buildCopywritingPrompt(
-        row.topic, row.pillar, undefined, await brandVoice(),
-        await require('./lib/pick-product').copywritingProductContext(row)
+        row.topic, row.pillar, undefined, await brandVoice(), productCtx
       );
-      const raw = await callOpenRouter([
-        { role: 'system', content: prompt },
-        { role: 'user', content: `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.` },
-      ]);
-      const parsed = parseCopywritingResponse(raw);
-      if (!parsed) throw new Error('Failed to parse copywriting response');
+
+      // 事实拦截:没有可核实来源的具体数字一律不许出现。提示词只能"尽量",
+      // 这里代码说了算 —— 编了就重写一次,还编就这一篇失败让人介入,
+      // 绝不把编造的数字发到 Fanz 官方账号上。
+      const { checkFabricatedClaims } = require('./lib/qa-claims');
+      const assignedMeta = productCtx && productCtx.assigned;
+      let parsed = null, claimIssues = [];
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const raw = await callOpenRouter([
+          { role: 'system', content: prompt },
+          { role: 'user', content: attempt === 1
+            ? `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.`
+            : `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.\n\nYour previous attempt was rejected for stating facts we cannot verify:\n${claimIssues.join('\n')}\nRewrite it without any unverifiable number.` },
+        ]);
+        const candidate = parseCopywritingResponse(raw);
+        if (!candidate) throw new Error('Failed to parse copywriting response');
+        const claims = checkFabricatedClaims(
+          `${candidate.fb_content}\n${candidate.ig_content}`, assignedMeta
+        );
+        if (claims.ok) { parsed = candidate; break; }
+        claimIssues = claims.blocking;
+        console.warn(`[qa-claims] row ${row.id} attempt ${attempt} rejected: ${claimIssues.join(' | ')}`);
+      }
+      if (!parsed) {
+        throw new Error(`Unverifiable claims after 2 attempts: ${claimIssues.join('; ')}`);
+      }
 
       const validation = validateCopywritingResult(parsed);
       if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
@@ -984,6 +1004,32 @@ async function batchGenerateContent(chatId, planId) {
       results.push({ id: row.id, topic: row.topic, success: false, error: err.message });
       await bot.sendMessage(chatId, `❌ ${i+1}/${total}: ${row.topic} — Generation failed.`);
     }
+  }
+
+  // 整月查重 —— 代码层统计,不靠提示词祈祷。
+  // 2026-08-01 实测:上一批 12 篇里 8 篇的图上副标题一模一样、6 篇开头第一句
+  // 完全相同。这种雷同发出去一眼就是机器做的,必须在人看得到的地方报出来。
+  try {
+    const { checkMonthlyRepetition, formatRepetitionReport } = require('./lib/qa-content');
+    const finalRows = await supabase.listContentCalendarByPlanId(planId);
+    const rep = checkMonthlyRepetition(
+      (finalRows || []).map((r) => {
+        const spec = (() => { try { return typeof r.compose_spec === 'string' ? JSON.parse(r.compose_spec) : (r.compose_spec || {}); } catch (_) { return {}; } })();
+        return { topic: r.topic, pillar: r.pillar, fb_content: r.fb_content, imageTexts: spec.image_texts || null };
+      })
+    );
+    const report = formatRepetitionReport(rep);
+    if (report) {
+      console.warn(`[qa-content] plan ${planId}:\n${report}`);
+      await bot.sendMessage(chatId, report);
+      try {
+        await supabasePlans.updateContentPlan(planId, {
+          notes: `[repetition check]\n${rep.alerts.join('\n')}`.slice(0, 4000),
+        });
+      } catch (_) { /* notes 写不进不影响主流程 */ }
+    }
+  } catch (err) {
+    console.error('[qa-content] monthly repetition check failed:', err.message);
   }
 
   // Summary
