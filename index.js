@@ -753,11 +753,15 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
       } catch (err) {
         console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
       }
+      // 内容角度 + 品牌事实配额:规划时一次算死整月分布（确定性算法，不问模型）。
+      // 只靠提示词说"角度要多样"是概率性的——实测 12 篇会写成同一篇的 12 个变体。
+      const angleAssignments = require('./lib/content-angles').planContentAnglesByDate(parsed.posts);
       for (const [postIndex, post] of parsed.posts.entries()) {
         try {
           // Use DB-safe pillar (festival → story)
           const dbPillar = mapPillarForDB(post.pillar);
           const pick = productPicks[postIndex] || null;
+          const aa = angleAssignments[postIndex] || {};
           const calRow = await supabase.createContentCalendar({
             chat_id: String(chatId),
             pillar: dbPillar,
@@ -766,6 +770,9 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
             suggested_date: post.suggested_date,
             plan_id: planId,
             status: 'planned',
+            // content_calendar 没有 angle 列，走 compose_spec（jsonb，pipeline 读它时会 merge）。
+            // is_festival 也存这里：pillar 落库会被映射成 story，写完就分不出节庆帖了。
+            compose_spec: { angle: aa.angle || null, brand_fact: aa.brandFact || null, is_festival: post.pillar === 'festival' },
             ...(pick ? { source_product_image: pick.name } : {}),
           });
           createdCalendarIds.push(calRow.id);
@@ -956,8 +963,15 @@ async function batchGenerateContent(chatId, planId) {
       // 把素材库现货 + 本篇已定型号喂给文案 —— 否则文案会写出库里没有的型号,
       // 再被提炼成图上标题(实测出现过"标题 36 吋 AURA / 画面 FS 563L")
       const productCtx = await require('./lib/pick-product').copywritingProductContext(row);
+      // 本篇的内容角度 + 品牌事实配额（规划时算好，存在 compose_spec）。
+      // 读不到就退回不给角度约束——不阻断，但整月会缺多样性，qa 那层会报出来。
+      const rowSpec = (() => {
+        try { return typeof row.compose_spec === 'string' ? JSON.parse(row.compose_spec) : (row.compose_spec || {}); }
+        catch (_) { return {}; }
+      })();
+      const angleCtx = rowSpec.angle ? { angle: rowSpec.angle, brandFact: rowSpec.brand_fact || null } : null;
       const prompt = buildCopywritingPrompt(
-        row.topic, row.pillar, undefined, await brandVoice(), productCtx
+        row.topic, row.pillar, undefined, await brandVoice(), productCtx, angleCtx
       );
 
       // 事实拦截:没有可核实来源的具体数字一律不许出现。提示词只能"尽量",
@@ -1011,20 +1025,28 @@ async function batchGenerateContent(chatId, planId) {
   // 完全相同。这种雷同发出去一眼就是机器做的,必须在人看得到的地方报出来。
   try {
     const { checkMonthlyRepetition, formatRepetitionReport } = require('./lib/qa-content');
+    const { checkAngleDistribution, formatAngleReport } = require('./lib/content-angles');
     const finalRows = await supabase.listContentCalendarByPlanId(planId);
-    const rep = checkMonthlyRepetition(
-      (finalRows || []).map((r) => {
-        const spec = (() => { try { return typeof r.compose_spec === 'string' ? JSON.parse(r.compose_spec) : (r.compose_spec || {}); } catch (_) { return {}; } })();
-        return { topic: r.topic, pillar: r.pillar, fb_content: r.fb_content, imageTexts: spec.image_texts || null };
-      })
-    );
-    const report = formatRepetitionReport(rep);
+    const qaRows = (finalRows || []).map((r) => {
+      const spec = (() => { try { return typeof r.compose_spec === 'string' ? JSON.parse(r.compose_spec) : (r.compose_spec || {}); } catch (_) { return {}; } })();
+      return {
+        topic: r.topic,
+        pillar: spec.is_festival ? 'festival' : r.pillar,
+        angle: spec.angle || null,
+        fb_content: r.fb_content,
+        imageTexts: spec.image_texts || null,
+      };
+    });
+    const rep = checkMonthlyRepetition(qaRows);
+    // 角度分布 + 品牌事实配额:前者查代码分配的结果,后者查模型有没有听话。
+    const ang = checkAngleDistribution(qaRows);
+    const report = [formatRepetitionReport(rep), formatAngleReport(ang)].filter(Boolean).join('\n\n');
     if (report) {
       console.warn(`[qa-content] plan ${planId}:\n${report}`);
       await bot.sendMessage(chatId, report);
       try {
         await supabasePlans.updateContentPlan(planId, {
-          notes: `[repetition check]\n${rep.alerts.join('\n')}`.slice(0, 4000),
+          notes: `[repetition check]\n${[...rep.alerts, ...ang.alerts].join('\n')}`.slice(0, 4000),
         });
       } catch (_) { /* notes 写不进不影响主流程 */ }
     }
@@ -1724,10 +1746,13 @@ bot.on('message', async (msg) => {
             } catch (err) {
               console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
             }
+            // 同上:内容角度 + 品牌事实配额在规划时一次算死（见另一处 /plan_month）
+            const angleAssignments = require('./lib/content-angles').planContentAnglesByDate(parsed.posts);
             for (const [postIndex, post] of parsed.posts.entries()) {
               try {
                 const dbPillar = mapPillarForDB(post.pillar);
                 const pick = productPicks[postIndex] || null;
+                const aa = angleAssignments[postIndex] || {};
                 const calRow = await require('./lib/supabase').createContentCalendar({
                   chat_id: String(chatId),
                   pillar: dbPillar,
@@ -1736,6 +1761,7 @@ bot.on('message', async (msg) => {
                   suggested_date: post.suggested_date,
                   plan_id: planId,
                   status: 'planned',
+                  compose_spec: { angle: aa.angle || null, brand_fact: aa.brandFact || null, is_festival: post.pillar === 'festival' },
                   ...(pick ? { source_product_image: pick.name } : {}),
                 });
                 createdCalendarIds.push(calRow.id);
