@@ -971,7 +971,10 @@ async function batchGenerateContent(chatId, planId) {
       })();
       const angleCtx = rowSpec.angle ? { angle: rowSpec.angle, brandFact: rowSpec.brand_fact || null } : null;
       const prompt = buildCopywritingPrompt(
-        row.topic, row.pillar, undefined, await brandVoice(), productCtx, angleCtx
+        // suggested_date 必传:整月内容是提前排好的，用生成当天的日期写会得到
+        // "国庆快到了"排在 9 月 28 日这种常识错误（2026-08-01 干测实测）。
+        row.topic, row.pillar, undefined, await brandVoice(), productCtx, angleCtx,
+        row.suggested_date || row.scheduled_date || null
       );
 
       // 事实拦截:没有可核实来源的具体数字一律不许出现。提示词只能"尽量",
