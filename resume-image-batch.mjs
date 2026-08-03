@@ -21,6 +21,30 @@ const todo = (rows || []).filter((r) => r.fb_content && !r.image_url)
 console.log(`plan ${planId}: ${rows.length} 篇,其中 ${todo.length} 篇待出图`);
 if (!todo.length) process.exit(0);
 
+// ── 出图前先验状态,别烧完钱才发现走不通 ──
+//
+// 2026-08-03 实测:第一张图整整生成了 182 秒、logo 也贴好了、自检也跑完了,
+// 最后一步才被状态机拒掉("copy_done" → "image_ready" 不合法)—— 状态机没错,
+// 是我建种子行时把 status 停在 copy_done(生产里那是「文案已生成,等人审」)。
+// 出图合法起点是 copy_approved / image_retry。
+// 这种检查必须在**花钱之前**做:错的状态提前一秒就能查出来,事后查代价是一次出图。
+const IMAGERY_OK = ['copy_approved', 'image_retry'];
+const badState = todo.filter((r) => !IMAGERY_OK.includes(r.status));
+if (badState.length) {
+  console.error(`\n⛔ ${badState.length} 篇的状态不能出图(合法起点:${IMAGERY_OK.join(' / ')}):`);
+  for (const r of badState) console.error(`   ${r.suggested_date}  status=${r.status}`);
+  console.error('\n生产流程里 copy_done 要先经人工审核才会变 copy_approved。');
+  console.error('这是验收批就先推状态,再重跑本脚本。一张图 ~180 秒,别让它跑完才发现。');
+  process.exit(1);
+}
+// 上一轮被中断留下的 generating 声明会让本轮跳过认领,先清掉
+for (const r of todo) {
+  if (r.image_status === 'generating') {
+    try { await sb.updateContentCalendar(r.id, { image_status: 'pending' }); r.image_status = 'pending'; }
+    catch (e) { console.error(`重置 ${r.suggested_date} 的 generating 声明失败: ${e.message}`); }
+  }
+}
+
 const specOf = (r) => { try { return typeof r.compose_spec === 'string' ? JSON.parse(r.compose_spec) : (r.compose_spec || {}); } catch (_) { return {}; } };
 
 const t0 = Date.now(); const results = [];
