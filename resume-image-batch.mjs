@@ -53,10 +53,56 @@ for (const r of qaRows) {
 }
 console.log('\n' + (qc.formatRepetitionReport(qc.checkMonthlyRepetition(qaRows)) || '✅ 成品查重零报警'));
 console.log(ca.formatAngleReport(ca.checkAngleDistribution(qaRows)) || '✅ 角度/配额合规');
-console.log('\n════ 自检警告(降级留痕)════');
-let any = false;
-for (const r of finalRows) {
+// ════ 自检结果:哪几张被拦下 / 重生成 / logo 挪过位 ════
+// 这几件事以前只写在 console 里，跑完就查不到了 —— 验收要能逐张回答。
+console.log('\n════ 自检结果(逐张)════');
+const tally = { blocked: [], regen: [], moved: [], variantSwap: [], noLogo: [], warn: [] };
+for (const r of finalRows.sort((a, b) => String(a.suggested_date).localeCompare(String(b.suggested_date)))) {
   const s = specOf(r);
-  if (s.warnings && s.warnings.length) { any = true; console.log(`• ${String(r.topic).slice(0, 40)}: ${s.warnings.join(' | ')}`); }
+  const q = s.qa || {};
+  const lp = s.logo_placement || {};
+  const label = `${r.suggested_date} [${s.angle || '?'}]`;
+  const bits = [];
+  if (!r.image_url) { bits.push('❌ 未交付'); tally.blocked.push(label); }
+  if (q.attempt > 1) { bits.push(`🔁 重生成 ${q.attempt - 1} 次`); tally.regen.push(label); }
+  if (lp.movedFromDefault) { bits.push(`📍 logo ${lp.defaultPosition}→${lp.position}(${lp.reason})`); tally.moved.push(label); }
+  else if (lp.position) bits.push(`📍 logo ${lp.position} 默认位(对比 ${lp.contrast}:1 杂乱 ${lp.busyness})`);
+  if (lp.variant) bits.push(`logo ${lp.variant === 'blue' ? '蓝版' : '白版'}`);
+  if (s.logo_series && lp.variant && !s.logo_series.includes(lp.variant)) tally.variantSwap.push(label);
+  if ((s.warnings || []).some((w) => /NO logo/i.test(w))) { bits.push('⚠️ 没贴上 logo'); tally.noLogo.push(label); }
+  if ((q.blocking || []).length) bits.push(`拦截: ${q.blocking.join('; ')}`);
+  if ((q.failures || []).length) bits.push(`硬指标未过: ${q.failures.join('; ')}`);
+  if ((q.warnings || []).length) { tally.warn.push(label); bits.push(`警告: ${q.warnings.slice(0, 3).join('; ')}`); }
+  console.log(`${label} ${String(r.topic).slice(0, 34)}\n    ${bits.length ? bits.join('\n    ') : '一次过,零警告'}`);
 }
-if (!any) console.log('(无)');
+console.log('\n────  汇总  ────');
+console.log(`被拦下未交付 : ${tally.blocked.length}${tally.blocked.length ? ' — ' + tally.blocked.join(', ') : ''}`);
+console.log(`重生成过     : ${tally.regen.length}${tally.regen.length ? ' — ' + tally.regen.join(', ') : ''}`);
+console.log(`logo 挪过位  : ${tally.moved.length}${tally.moved.length ? ' — ' + tally.moved.join(', ') : ''}`);
+console.log(`logo 换版本  : ${tally.variantSwap.length}`);
+console.log(`没贴上 logo  : ${tally.noLogo.length}`);
+console.log(`带警告交付   : ${tally.warn.length}`);
+
+// 实测花费(图片 API 真实用量,不估算)
+const usage = finalRows.map((r) => specOf(r).image_usage).filter(Boolean);
+if (usage.length) {
+  const outTok = usage.reduce((a, u) => a + (u.output_tokens || 0), 0);
+  console.log(`\n图片 API 实测: ${usage.length} 次调用, output ${outTok} tokens`);
+}
+
+// 把成品图下载到桌面,方便直接看/发给 Edwin
+const dir = '/Users/mryew/Desktop/fanz-batch-images';
+fs.default.mkdirSync(dir, { recursive: true });
+let saved = 0;
+for (const r of finalRows.sort((a, b) => String(a.suggested_date).localeCompare(String(b.suggested_date)))) {
+  if (!r.image_url) continue;
+  try {
+    const res = await fetch(r.image_url);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const s = specOf(r);
+    fs.default.writeFileSync(`${dir}/${r.suggested_date}-${s.angle || 'x'}.png`, buf);
+    saved++;
+  } catch (e) { console.error(`下载失败 ${r.suggested_date}: ${e.message}`); }
+}
+console.log(`\n成品图已存到 ${dir}(${saved} 张)`);
