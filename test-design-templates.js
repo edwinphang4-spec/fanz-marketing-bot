@@ -36,7 +36,11 @@ const t = (c, m) => c ? (pass++, console.log('  PASS:', m)) : (fail++, console.e
   console.log('\n[3] full_ai prompt 要素(festival)');
   const fp = buildFullAiPrompt({ topic: 'Happy Chinese New Year 2027', post_angle: 'year of the goat' }, TEMPLATES.festival_illustration);
   t(/Happy Chinese New Year 2027/.test(fp), '标题文字进 prompt');
-  t(/top centre.*logo|logo.*top centre/i.test(fp), '顶部中央留 logo 空位');
+  // 2026-08-03 改:原来只要求"顶部中央留白",而标题恰恰写在那儿(09-16 实测
+  // "Celebrate" 压住了 logo)。现在要求四个角全留白,贴 logo 时实测背景再挑一个。
+  t(/ALL FOUR CORNERS clear/i.test(fp), '四个角都要求留白');
+  t(/away from every corner/i.test(fp), '要求标题远离所有角落');
+  t(!/top centre.*logo/i.test(fp), '不再把 logo 空位写死在顶部中央');
   t(/Do NOT draw any logo|brand name/i.test(fp), '禁画品牌字样');
   t(/Do NOT include any ceiling fan/i.test(fp), '禁产品');
 
