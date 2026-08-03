@@ -9,6 +9,7 @@
 // 新规则:品牌蓝是默认,白版只留给真正的暗背景。
 const sharp = require('sharp');
 const qa = require('./lib/qa-image');
+const da = require('./lib/design-agent');
 
 let pass = 0, fail = 0;
 function assert(cond, name) {
@@ -54,6 +55,38 @@ async function solid(rgb, W = 1024, H = 1024) {
   assert(qa.decideLogoPlacement(score(REAL['2026-09-30 三代同堂']), 'top_right').position === 'top_left', '09-30 挪到左上');
   assert(qa.decideLogoPlacement(score(REAL['2026-09-29 雨天']), 'top_right').position === 'top_right',
     `09-29 两角差 0.07 属噪声 → 不挪(阈值 ${qa.MOVE_MIN_GAIN})`);
+
+  console.log('\n--- 挪位不许挪到文字上方(09-30 的教训)---');
+  // 判据是**垂直留白**不是几何相交:09-30 的 logo 框底在画布 18%、标题从 30% 起,
+  // 两者根本不相交,按"重叠"判会放行 —— 但视觉上就是挤成一团。
+  const H = 1024;
+  const withText = (rows, textTop) => rows.map(([position, bgRgb, busyness]) => {
+    const box = qa.logoFootprint(1024, H, { logoPosition: position, logoWidthRatio: 0.12 });
+    const gap = Math.round(H * qa.LOGO_TEXT_MIN_GAP);
+    return {
+      position, bgRgb, busyness,
+      luminance: +qa.relLuminance(bgRgb).toFixed(4),
+      cBlue: +qa.contrastRatio(qa.BRAND_BLUE_RGB, bgRgb).toFixed(2),
+      cWhite: +qa.contrastRatio(qa.WHITE_RGB, bgRgb).toFixed(2),
+      overlapsText: (box.top + box.height + gap) > textTop * H,
+    };
+  });
+  // 09-30:文字从 30% 起 → 左上只剩 12% 留白 → 不许挪过去
+  const tight = qa.decideLogoPlacement(withText(REAL['2026-09-30 三代同堂'], 0.30), 'top_right');
+  assert(tight.position === 'top_right', '09-30 文字太高 → 留在右上角(那里是空的)');
+  assert(tight.scrim === true, '09-30 留在原位 → 用淡底衬补对比,而不是挪到文字上');
+  assert(tight.variant === 'blue', '09-30 仍然是蓝版');
+  // 同一张图,若文字排在 45%(留白 27%)→ 挪位恢复正常
+  const loose = qa.decideLogoPlacement(withText(REAL['2026-09-30 三代同堂'], 0.45), 'top_right');
+  assert(loose.position === 'top_left', '同一张图文字排低一点 → 又可以挪到左上');
+  // Edwin 认可的三张不受影响
+  for (const [name, top] of [['2026-09-01 卧室', 0.40], ['2026-09-03 客厅', 0.45]]) {
+    const d = qa.decideLogoPlacement(withText(REAL[name], top), 'top_right');
+    assert(d.position === 'top_left', `${name} 留白足够 → 挪位不受影响`);
+  }
+  // 提示词规定的文字区(42%)对顶部角落天然安全
+  const declared = qa.decideLogoPlacement(withText(REAL['2026-09-30 三代同堂'], da.TEXT_ZONE_TOP), 'top_right');
+  assert(declared.position === 'top_left', `提示词规定文字在 ${da.TEXT_ZONE_TOP * 100}% 以下时,顶部角落安全`);
 
   console.log('\n--- 单色背景(四角一样,无处可挪)才轮到底衬 ---');
   const flat = await qa.pickLogoPlacement(await solid([151, 118, 87]));
