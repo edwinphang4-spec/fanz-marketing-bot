@@ -95,8 +95,16 @@ async function checkPromptUnit() {
   // 关键回归:计划器不许把选品池外的系列当成"可用产品"列出来（否则配图必然对不上）。
   // 注意别误判——禁止清单本身会提到这些名字，所以断言要看"是否被列为可用项"。
   assert(!/^- Smart Series/m.test(prompt), 'Smart Series is not listed as an available series');
-  assert(!/^- AURA Series/m.test(prompt), 'AURA is not listed as an available series');
-  assert(!/^- Inno Series/m.test(prompt), 'Inno is not listed as an available series');
+  // 2026-08-04 更新:AURA / INNO 当初被排除是因为**规格未确认、没有产品图**,
+  // 不是因为它们不存在。Fanz 官方清单确认了规格(AURA 3 TONE LED、
+  // INNO435L 43" / INNO525L 52"),清单里内嵌的产品照也建进库了 → 现在是合法可用系列。
+  // 真正该守的红线没变:选品池里没有素材的系列不许列出来。
+  assert(/^- AURA Series/m.test(prompt), 'AURA 现在有素材有规格,应列为可用系列');
+  assert(/^- INNO Series/m.test(prompt), 'INNO 现在有素材有规格,应列为可用系列');
+  // VIOZ 是另一个品牌(5 年保修、无 WiFi),永远不该出现在 Fanz 的可用系列里
+  assert(!/^- (VETTA|WINDY|AXEL|FF\d) /m.test(prompt), 'VIOZ 系列不出现在 Fanz 可用清单里');
+  // 池里没有素材的型号也不许列(SPINOR 是角扇、已移出池)
+  assert(!/^- SPINOR Series/m.test(prompt), 'SPINOR(角扇,已移出池)不列为可用系列');
   assert(/do NOT (?:name, imply, or invent|mention)/i.test(prompt), 'prompt forbids inventing other series');
   assert(/Never claim WiFi/i.test(prompt), 'prompt forbids unverified WiFi claims');
 }
