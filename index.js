@@ -1257,6 +1257,31 @@ function buildTitleDraftCard(d) {
 // 单篇流：建 calendar 行 → 现有 copywriting 管线 → 现有审批卡。
 // 之后的 approve 按钮（review_approve）沿用现有出图链路，零新机制。
 async function runSinglePostFromDraft(chatId, draft) {
+  // ── 她说了哪台,就必须是哪台 ──
+  // 2026-08-05 实测事故:她说「推 INNO525L」,Mark 卡片也显示 "Product: INNO525L",
+  // 生成出来是 DELTA56 —— 因为这里建行时**根本没传 draft.product**,
+  // generateCopy 于是自己另挑一台。这不是选错,是**嘴上答应实际没执行**,
+  // 和「说了要排整月却不发动作」是同一类问题:她以为交代过了,系统当没听见。
+  //
+  // 解析不出来就明说,绝不拿别的型号顶替 —— 静悄悄换一台比直接报错更伤。
+  let resolved = null;
+  if (draft.product) {
+    try {
+      resolved = await require('./lib/pick-product').resolveAssetByModel(draft.product);
+    } catch (err) {
+      console.error('[single] 型号解析失败:', err.message);
+    }
+    if (!resolved) {
+      await bot.sendMessage(chatId,
+        `素材库里没有「${draft.product}」这台,我不会拿别的型号顶替。\n换一个型号,或者不指定型号让我从库里挑。`);
+      return null;
+    }
+    if (!resolved.exactModel || (resolved.colourAsked && !resolved.colourMatched)) {
+      await bot.sendMessage(chatId,
+        `库里没有完全对上「${draft.product}」,最接近的是 ${resolved.name},就用这台。`);
+    }
+  }
+
   const row = await supabase.createContentCalendar({
     chat_id: String(chatId),
     pillar: mapPillarForDB(draft.pillar || 'product'),
@@ -1264,18 +1289,17 @@ async function runSinglePostFromDraft(chatId, draft) {
     post_angle: draft.angle || null,
     suggested_date: draft.suggested_date || null,
     status: 'selected',
+    ...(resolved ? { source_product_image: resolved.name } : {}),
   });
   // 走统一入口:单篇同样要有选品池/角度/按排期日/编造拦截。
   // 单篇没有"整月"可分配品牌事实,generateCopy 默认一条都不提(与 Fanz 真实帖子一致),
   // 只有选题里明确要讲保修/SIRIM/DC 时才放行那一条。
-  const { parsed, meta } = await generateCopy({
+  // 型号/角度/品牌事实的写回现在由 generateCopy 自己做（它才是决定这三样的地方，
+  // 由调用方各写各的正是上一版漏掉 compose_spec.angle 的原因）。
+  const { parsed } = await generateCopy({
     row, topic: draft.title, pillar: draft.pillar,
     brandVoice: await brandVoice(), callLLM: callOpenRouter,
   });
-  if (meta.product && !row.source_product_image) {
-    // generateCopy 替这篇挑了产品 —— 写回行上,出图时才不会另挑一台造成图文不符
-    try { await supabase.updateContentCalendar(row.id, { source_product_image: meta.product }); } catch (_) {}
-  }
   await supabase.updateContentCalendar(row.id, {
     fb_content: parsed.fb_content,
     ig_content: parsed.ig_content,
