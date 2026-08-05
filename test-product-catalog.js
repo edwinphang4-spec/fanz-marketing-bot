@@ -73,5 +73,19 @@ for (const [m, s] of Object.entries(c.CATALOG)) {
 }
 assert(true, '无灯型号不带 LED 功率 / 每个型号至少一个 SKU');
 
+console.log('\n--- 产品定位(清单没有分类列,只标明显的)---');
+assert(c.productClass('HEPTA72') === 'commercial', 'HEPTA72 标为商用(全系唯一铝合金+CFM 15000)');
+assert(c.allowedInResidentialPool('HEPTA72') === false, '商用型号不进家用内容池');
+for (const m of ['DELTA66', 'GAZE66L', 'GAZE66N', 'V605', 'FS62L']) {
+  assert(c.productClass(m) === 'unknown', `${m} 标 unknown —— 没有依据说是商用,不瞎猜`);
+  assert(c.allowedInResidentialPool(m) === true, `${m} 仍可进家用池(unknown ≠ 商用)`);
+}
+assert(c.allowedInResidentialPool('GRANDE523L') === false, '数据存疑的型号本来就进不了池');
+const klasses = new Set(Object.keys(c.CATALOG).map((m) => c.productClass(m)));
+assert([...klasses].every((k) => ['commercial', 'unknown'].includes(k)),
+  '只有 commercial / unknown 两种取值(residential 要等 Fanz 确认才敢标)');
+assert(Object.keys(c.PRODUCT_CLASS).length === 1, '只有 1 个型号敢标定位,其余等 Fanz');
+assert(c.PRODUCT_CLASS_EVIDENCE.HEPTA72, '标了商用的必须写明依据');
+
 console.log(`\n${fail === 0 ? '✅' : '❌'} ${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
