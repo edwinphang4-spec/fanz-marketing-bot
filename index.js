@@ -7,6 +7,9 @@ const supabase = require('./lib/supabase');
 const supabasePlans = require('./lib/supabase-plans');
 const { buildPlanSystemPrompt, parsePlanResponse, validateSelection, createSelectionPayload } = require('./lib/planning');
 const { buildCopywritingPrompt, parseCopywritingResponse, validateCopywritingResult } = require('./lib/copywriting');
+// 所有文案生成的唯一入口 —— 选品池/角度配额/按排期日/编造拦截四样绑在里面。
+// 2026-08-05 之前这四样只接在"月度批量"一条路上,另外 5 条路(含两处"驳回重写")全是旧行为。
+const { generateCopy } = require('./lib/generate-copy');
 const brandKitData = require('./lib/brand');
 const { publishToSocial } = require('./lib/publish');
 
@@ -19,7 +22,6 @@ const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = req
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
 const { schedulePlan, formatScheduleTable } = require('./lib/monthly-scheduler');
 const { checkTodayPosts, buildReminderMessage } = require('./cron-publish-reminder');
-const { classifyIntent } = require('./lib/intent-router');
 const mark = require('./lib/mark');
 const worker = require('./lib/worker');
 
@@ -233,9 +235,10 @@ function buildRejectPayload(notes) {
 //   digit + plan      → 'plan_selection'
 //   awaiting review   → 'review_notes'
 //   starts with /     → 'command'
-//   otherwise         → 'free_text'  (routed through classifyIntent() for intent-based handling)
-//                                      See lib/intent-router.js for intent classification.
-//                                      The classifyIntent() call dispatches to:
+//   otherwise         → 'free_text'  (全部交给 Mark，见 lib/mark.js)
+//                                      2026-08-05:旧的 intent-router 分类层已删除 ——
+//                                      它在 Mark 接管后就是死代码(前面有 return),
+//                                      而且能力比 Mark 弱(只分 5 类、不会追问、不懂产品库)。
 //                                        chitchat   → consultant reply
 //                                        plan_month → monthly planning flow
 //                                        generate_post → generateContent(pillar, topic)
@@ -252,10 +255,67 @@ function decideMessageIntent(text, hasPlanSession, hasAwaitingReview) {
 // ============================================
 // PRODUCT CONTEXT (from products.js)
 // ============================================
-function buildProductContext() {
-  return products.map(p =>
-    `- ${p.name} (${p.typeZh}/${p.type}): ${p.descriptionZh || p.description}\n  Key features: ${p.keySellingPoints.join(', ')}`
-  ).join('\n');
+// Mark 看到的产品清单。
+//
+// 2026-08-05 之前这里返回的是 products.js 里**写死的 4 个**
+// (FS Series 563 L / Grande L Series / Smart Series / AURA Series),
+// 其中 Smart Series 是我们早就判定**不存在**的系列 —— Mark 会主动向老板娘推荐它。
+// 而真实选品池有 25 个型号 / 10 个系列,Mark 一个都不知道,
+// 老板娘说"推 DELTA 的""推 HEPTA 的"它接不住。
+//
+// 现在改成从选品池实时生成。缓存 5 分钟(Mark 每轮对话都要用,不能每次打库)。
+// 读不到就退回写死清单**并去掉 Smart Series**,不阻断对话。
+let _productCtxCache = { text: null, at: 0 };
+const PRODUCT_CTX_TTL_MS = 5 * 60_000;
+
+async function buildProductContext() {
+  const now = Date.now();
+  if (_productCtxCache.text && now - _productCtxCache.at < PRODUCT_CTX_TTL_MS) {
+    return _productCtxCache.text;
+  }
+  try {
+    const brandLib = require('./lib/brand');
+    const { seriesOf } = require('./lib/pick-product');
+    const catalog = require('./lib/product-catalog');
+    const assets = await brandLib.listProductAssets();
+    const pool = assets.filter((a) => a && a.metadata && a.metadata.in_pool === true);
+    if (pool.length === 0) throw new Error('pool empty');
+
+    const bySeries = new Map();
+    for (const a of pool) {
+      const md = a.metadata || {};
+      const key = seriesOf(a);
+      if (!bySeries.has(key)) bySeries.set(key, { models: new Map(), colours: new Set() });
+      const e = bySeries.get(key);
+      if (md.color) e.colours.add(md.color);
+      const m = md.catalog_model;
+      if (!m) continue;
+      if (!e.models.has(m)) {
+        const spec = catalog.CATALOG[m] || {};
+        e.models.set(m, {
+          size: md.size_inches, blades: md.blade_count,
+          led: md.has_led, spaces: md.spaces || [],
+          cfm: spec.cfm || null,
+        });
+      }
+    }
+    const lines = [...bySeries.entries()].map(([series, e]) => {
+      const models = [...e.models.entries()].map(([m, v]) =>
+        `${m} (${v.size}", ${v.blades} blades, ${v.led ? 'with LED' : 'no light'})`).join('; ');
+      const spaces = [...new Set([...e.models.values()].flatMap((v) => v.spaces))].join('/');
+      return `- ${series} Series — ${models}\n  Suits: ${spaces || 'n/a'}`;
+    });
+    const text = `These are the ONLY models we have marketing photos for — never propose anything else:\n${lines.join('\n')}`;
+    _productCtxCache = { text, at: now };
+    return text;
+  } catch (err) {
+    console.error('[productContext] 选品池读取失败,退回写死清单:', err.message);
+    // 兜底也要剔掉不存在的系列 —— 宁可少列,也不要让 Mark 推荐幽灵产品
+    return products
+      .filter((p) => !/smart\s*series/i.test(p.name))
+      .map((p) => `- ${p.name}: ${p.descriptionZh || p.description}`)
+      .join('\n');
+  }
 }
 
 // ============================================
@@ -318,20 +378,18 @@ async function generateContent(command, userText) {
     story: 'Fanz brand story — 10 years of quality and trust',
   }[command] || 'Product promotion');
 
-  // Build system prompt from the shared copywriting module
-  const systemPrompt = buildCopywritingPrompt(topic, pillar, undefined, await brandVoice());
-
-  // User message — short, just the brief
-  const userPrompt = userText
-    ? `Generate the post based on this brief: "${userText}"`
-    : 'Generate the post.';
-
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: userPrompt },
-  ];
-
-  return await callOpenRouter(messages);
+  // 走统一入口。/product /case /promo /story 这几条命令不落库、直接回文本,
+  // 但同样要有选品池/角度/编造拦截 —— 2026-08-05 之前它们一样都没有。
+  // 没有 row,所以没有排期日:这类即兴生成"今天"就是发布日,是对的。
+  const { parsed } = await generateCopy({
+    topic, pillar, brandVoice: await brandVoice(), callLLM: callOpenRouter,
+  });
+  // 还原成调用方期待的分段文本(它们直接把返回值发给用户)
+  return [
+    '📱 FACEBOOK VERSION', parsed.fb_content, '',
+    '📸 INSTAGRAM VERSION', parsed.ig_content, '',
+    '#⃣ HASHTAGS', parsed.hashtags,
+  ].join('\n');
 }
 
 // ============================================
@@ -962,49 +1020,11 @@ async function batchGenerateContent(chatId, planId) {
     try {
       // 把素材库现货 + 本篇已定型号喂给文案 —— 否则文案会写出库里没有的型号,
       // 再被提炼成图上标题(实测出现过"标题 36 吋 AURA / 画面 FS 563L")
-      const productCtx = await require('./lib/pick-product').copywritingProductContext(row);
-      // 本篇的内容角度 + 品牌事实配额（规划时算好，存在 compose_spec）。
-      // 读不到就退回不给角度约束——不阻断，但整月会缺多样性，qa 那层会报出来。
-      const rowSpec = (() => {
-        try { return typeof row.compose_spec === 'string' ? JSON.parse(row.compose_spec) : (row.compose_spec || {}); }
-        catch (_) { return {}; }
-      })();
-      const angleCtx = rowSpec.angle ? { angle: rowSpec.angle, brandFact: rowSpec.brand_fact || null } : null;
-      const prompt = buildCopywritingPrompt(
-        // suggested_date 必传:整月内容是提前排好的，用生成当天的日期写会得到
-        // "国庆快到了"排在 9 月 28 日这种常识错误（2026-08-01 干测实测）。
-        row.topic, row.pillar, undefined, await brandVoice(), productCtx, angleCtx,
-        row.suggested_date || row.scheduled_date || null
-      );
-
-      // 事实拦截:没有可核实来源的具体数字一律不许出现。提示词只能"尽量",
-      // 这里代码说了算 —— 编了就重写一次,还编就这一篇失败让人介入,
-      // 绝不把编造的数字发到 Fanz 官方账号上。
-      const { checkFabricatedClaims } = require('./lib/qa-claims');
-      const assignedMeta = productCtx && productCtx.assigned;
-      let parsed = null, claimIssues = [];
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        const raw = await callOpenRouter([
-          { role: 'system', content: prompt },
-          { role: 'user', content: attempt === 1
-            ? `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.`
-            : `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.\n\nYour previous attempt was rejected for stating facts we cannot verify:\n${claimIssues.join('\n')}\nRewrite it without any unverifiable number.` },
-        ]);
-        const candidate = parseCopywritingResponse(raw);
-        if (!candidate) throw new Error('Failed to parse copywriting response');
-        const claims = checkFabricatedClaims(
-          `${candidate.fb_content}\n${candidate.ig_content}`, assignedMeta
-        );
-        if (claims.ok) { parsed = candidate; break; }
-        claimIssues = claims.blocking;
-        console.warn(`[qa-claims] row ${row.id} attempt ${attempt} rejected: ${claimIssues.join(' | ')}`);
-      }
-      if (!parsed) {
-        throw new Error(`Unverifiable claims after 2 attempts: ${claimIssues.join('; ')}`);
-      }
-
-      const validation = validateCopywritingResult(parsed);
-      if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
+      // 四样(选品池/角度配额/按排期日/编造拦截)全在 generateCopy 里,不再逐个传。
+      const { parsed } = await generateCopy({
+        row, topic: row.topic, pillar: row.pillar,
+        brandVoice: await brandVoice(), callLLM: callOpenRouter,
+      });
 
       await supabase.updateContentCalendar(row.id, {
         fb_content: parsed.fb_content,
@@ -1245,15 +1265,17 @@ async function runSinglePostFromDraft(chatId, draft) {
     suggested_date: draft.suggested_date || null,
     status: 'selected',
   });
-  const prompt = buildCopywritingPrompt(draft.title, draft.pillar, undefined, await brandVoice());
-  const rawCopy = await callOpenRouter([
-    { role: 'system', content: prompt },
-    { role: 'user', content: 'Generate social media content for this Fanz topic.' },
-  ]);
-  const parsed = parseCopywritingResponse(rawCopy);
-  if (!parsed) throw new Error('copywriting parse failed');
-  const validation = validateCopywritingResult(parsed);
-  if (!validation.valid) throw new Error(`copywriting invalid: ${validation.errors.join('; ')}`);
+  // 走统一入口:单篇同样要有选品池/角度/按排期日/编造拦截。
+  // 单篇没有"整月"可分配品牌事实,generateCopy 默认一条都不提(与 Fanz 真实帖子一致),
+  // 只有选题里明确要讲保修/SIRIM/DC 时才放行那一条。
+  const { parsed, meta } = await generateCopy({
+    row, topic: draft.title, pillar: draft.pillar,
+    brandVoice: await brandVoice(), callLLM: callOpenRouter,
+  });
+  if (meta.product && !row.source_product_image) {
+    // generateCopy 替这篇挑了产品 —— 写回行上,出图时才不会另挑一台造成图文不符
+    try { await supabase.updateContentCalendar(row.id, { source_product_image: meta.product }); } catch (_) {}
+  }
   await supabase.updateContentCalendar(row.id, {
     fb_content: parsed.fb_content,
     ig_content: parsed.ig_content,
@@ -1348,17 +1370,12 @@ bot.on('message', async (msg) => {
     // Falls through silently on failure; the user still receives the generateContent output.
     if (createdRow && createdRow.id) {
       try {
-        const copywritingPrompt = buildCopywritingPrompt(plan.title, plan.direction, undefined, await brandVoice());
-        const copyRaw = await callOpenRouter([
-          { role: 'system', content: copywritingPrompt },
-          { role: 'user', content: `Generate social media content for this Fanz topic.` },
-        ]);
-        const parsed = parseCopywritingResponse(copyRaw);
-        if (!parsed) {
-          console.warn('copywriting parse returned null — falling back to generateContent only');
-        } else {
-          const validation = validateCopywritingResult(parsed);
-          if (validation.valid) {
+        // 走统一入口(旧 /plan 选题流同样要有四样保障)
+        const { parsed } = await generateCopy({
+          row: createdRow, topic: plan.title, pillar: plan.direction,
+          brandVoice: await brandVoice(), callLLM: callOpenRouter,
+        });
+        {
             await supabase.updateContentCalendar(createdRow.id, {
               fb_content: parsed.fb_content,
               ig_content: parsed.ig_content,
@@ -1380,11 +1397,10 @@ bot.on('message', async (msg) => {
             } catch (err) {
               console.error('review card send error:', err);
             }
-          } else {
-            console.warn(`copywriting validation failed (${validation.errors.join('; ')}) — falling back to generateContent only`);
-          }
         }
       } catch (err) {
+        // generateCopy 会在解析失败/校验失败/两次都编造时抛错 —— 这里保持原有行为:
+        // 静默降级,用户仍然拿到 generateContent 的输出,不阻断对话。
         console.error('copywriting pipeline error:', err);
         // Fall back silently — generateContent output still delivered below
       }
@@ -1640,7 +1656,7 @@ bot.on('message', async (msg) => {
       : null;
     const turn = await mark.markTurn(chatId, text, {
       callOpenRouter,
-      productContext: buildProductContext(),
+      productContext: await buildProductContext(),
       brandVoiceText: await brandVoice(),
       senderName: fromName,
     });
@@ -1663,216 +1679,6 @@ bot.on('message', async (msg) => {
   }
   return;
 
-  // === FREE TEXT — ROUTE THROUGH INTENT CLASSIFIER (legacy, unreachable) ===
-  // eslint-disable-next-line no-unreachable
-  try {
-    const brandContext = buildProductContext();
-    const classification = await classifyIntent(text, brandContext);
-
-    switch (classification.intent) {
-      case 'chitchat':
-      case 'greeting':
-        // Consultant-style friendly response
-        await bot.sendMessage(chatId, classification.response || 'Hi! How can I help you with your Fanz marketing today?');
-        break;
-
-      case 'plan_month':
-        // Trigger the monthly planning flow (same as /plan_month command)
-        await bot.sendMessage(chatId, '📅 Starting monthly content planning...');
-        // Simulate the /plan_month command by running the handler logic inline.
-        // We create a mock msg object and invoke the same code path.
-        {
-          const mockMatch = [null, '']; // match[1] = optional month input
-          const target = require('./lib/monthly-planning').parseTargetMonth(null);
-          const targetMonthStr = target.monthStr;
-
-          await bot.sendMessage(chatId, `📅 Generating monthly content plan for *${targetMonthStr}*...\nThis will take a moment.`, { parse_mode: 'Markdown' });
-
-          const systemPrompt = await require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
-          const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
-
-          const rawResponse = await callOpenRouter([
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ], 4000);
-
-          const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
-          const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
-
-          if (!parsed.valid || parsed.posts.length < 8) {
-            let detail = '';
-            if (parsed.errors.length > 0) {
-              detail += '\n' + parsed.errors.slice(0, 10).map(e => '• ' + e).join('\n');
-            }
-            if (parsed.warnings && parsed.warnings.length > 0) {
-              detail += '\n\n⚠️ Notes:\n' + parsed.warnings.slice(0, 15).map(w => '• ' + w).join('\n');
-            }
-            await bot.sendMessage(chatId,
-              `⚠️ The AI response did not produce a valid monthly plan.${detail}\n\nRaw response:\n\`\`\`\n${rawResponse.slice(0, 3000)}\n\`\`\``);
-            break;
-          }
-
-          // 同上:有效但掉了帖子也要留痕(见 /plan_month 那处注释)
-          const planIssues2 = summarizePlanIssues(parsed, 13);
-          if (planIssues2.summary) {
-            console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues2.summary}`);
-            try {
-              await bot.sendMessage(chatId,
-                `ℹ️ Plan notes for ${targetMonthStr}:\n${planIssues2.summary.slice(0, 1500)}`);
-            } catch (_) {}
-          }
-
-          let planId = null;
-          if (require('./lib/supabase').isConfigured()) {
-            try {
-              const planRow = await require('./lib/supabase-plans').createContentPlan({
-                month: targetMonthStr,
-                status: 'pending_approval',
-                chat_id: String(chatId),
-                total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
-                notes: `Generated via intent router` +
-                  (planIssues2.summary ? `\n\n[parser notes]\n${planIssues2.summary}` : ''),
-              });
-              planId = planRow.id;
-            } catch (err) {
-              console.error('content_plans creation error:', err);
-              await bot.sendMessage(chatId, `⚠️ Monthly plan generated but could not save to database.`);
-            }
-          }
-
-          const createdCalendarIds = [];
-          if (planId && require('./lib/supabase').isConfigured()) {
-            // 同上:规划时按素材库选品池定产品(见另一处 /plan_month 的注释)
-            let productPicks = [];
-            try {
-              productPicks = await require('./lib/pick-product').pickProductsForPlan(parsed.posts);
-            } catch (err) {
-              console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
-            }
-            // 同上:内容角度 + 品牌事实配额在规划时一次算死（见另一处 /plan_month）
-            const angleAssignments = require('./lib/content-angles').planContentAnglesByDate(parsed.posts);
-            for (const [postIndex, post] of parsed.posts.entries()) {
-              try {
-                const dbPillar = mapPillarForDB(post.pillar);
-                const pick = productPicks[postIndex] || null;
-                const aa = angleAssignments[postIndex] || {};
-                const calRow = await require('./lib/supabase').createContentCalendar({
-                  chat_id: String(chatId),
-                  pillar: dbPillar,
-                  topic: post.topic,
-                  post_angle: post.post_angle,
-                  suggested_date: post.suggested_date,
-                  plan_id: planId,
-                  status: 'planned',
-                  compose_spec: { angle: aa.angle || null, brand_fact: aa.brandFact || null, is_festival: post.pillar === 'festival' },
-                  ...(pick ? { source_product_image: pick.name } : {}),
-                });
-                createdCalendarIds.push(calRow.id);
-              } catch (err) {
-                console.error('createContentCalendar error:', err.message);
-                createdCalendarIds.push(null);
-              }
-            }
-          }
-
-          const sortedPosts = [...parsed.posts].sort((a, b) => a.suggested_date.localeCompare(b.suggested_date));
-          const weeks = [];
-          let currentWeek = [];
-          let currentWeekNum = null;
-
-          for (const post of sortedPosts) {
-            const d = new Date(post.suggested_date + 'T00:00:00+08:00');
-            const startOfYear = new Date(d.getFullYear(), 0, 1);
-            const weekNum = Math.ceil((((d - startOfYear) / 86400000) + startOfYear.getDay() + 1) / 7);
-            if (currentWeekNum !== null && weekNum !== currentWeekNum) {
-              weeks.push(currentWeek);
-              currentWeek = [];
-            }
-            currentWeekNum = weekNum;
-            currentWeek.push(post);
-          }
-          if (currentWeek.length > 0) weeks.push(currentWeek);
-
-          let output = `📅 *Monthly Content Plan — ${targetMonthStr}*\n\n`;
-          output += `*Pillar Breakdown:*\n`;
-          for (const [p, count] of Object.entries(parsed.pillarCounts)) {
-            if (p === 'festival') continue;
-            output += `📝 ${p}: ${count}\n`;
-          }
-          if (parsed.festivalPosts.length > 0) {
-            output += `🎊 festival: ${parsed.festivalPosts.length}\n`;
-          }
-          output += `\n`;
-
-          for (const week of weeks) {
-            output += `━━━ *Week* ━━━\n`;
-            for (const post of week) {
-              const dateFormatted = post.suggested_date.replace(/^\d{4}-/, '');
-              output += `${dateFormatted} 📝 *${post.topic}*\n`;
-              output += `   _${post.pillar}_ — ${post.post_angle}\n\n`;
-            }
-          }
-          output += `✅ *${parsed.regularPosts.length} regular posts + ${parsed.festivalPosts.length} festival posts generated*`;
-
-          const keyboardRows = [];
-          if (planId && createdCalendarIds.length > 0) {
-            for (let i = 0; i < sortedPosts.length; i++) {
-              const post = sortedPosts[i];
-              const calId = createdCalendarIds[i];
-              if (!calId) continue;
-              const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
-              monthActionMap.set(calId, planId);
-              keyboardRows.push([
-                { text: `✏️ ${shortTopic}`, callback_data: cb('me',calId) },
-                { text: `❌ Remove`, callback_data: cb('mr',calId) },
-                { text: `🔄 Replace`, callback_data: cb('mrp',calId) },
-              ]);
-            }
-            keyboardRows.push(
-              [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
-            );
-          }
-
-          await bot.sendMessage(chatId, output, {
-            parse_mode: 'Markdown',
-            reply_markup: planId ? { inline_keyboard: keyboardRows } : undefined,
-          });
-        }
-        break;
-
-      case 'generate_post':
-        // Generate content with detected pillar and topic
-        {
-          const pillar = classification.params && classification.params.pillar ? classification.params.pillar : 'product';
-          const topic = classification.params && classification.params.topic ? classification.params.topic : text;
-          await bot.sendMessage(chatId, `⏳ Generating ${pillar} post based on your request...`);
-          const content = await generateContent(pillar, topic);
-          await sendWithSplit(chatId, content, { parse_mode: 'Markdown' });
-        }
-        break;
-
-      case 'ask_question':
-        // Answer as marketing consultant
-        {
-          const answer = classification.response || 
-            (classification.params && classification.params.question 
-              ? `Great question about "${classification.params.question}"! Let me help with that.`
-              : 'Thanks for your question!');
-          await bot.sendMessage(chatId, answer);
-        }
-        break;
-
-      case 'unclear':
-      default:
-        // Ask clarifying question using the response field
-        await bot.sendMessage(chatId, classification.response || 
-          'I\'m not sure what you need. I can help with:\n\n📅 Monthly content planning\n✍️ Writing social media posts\n💡 Marketing advice & product questions\n\nWhat would you like?');
-        break;
-    }
-  } catch (err) {
-    console.error('intent router error:', err);
-    await bot.sendMessage(chatId, userMessage(err, 'Sorry, I had trouble processing your message. Please try again or use a command like /product or /plan.'));
-  }
 });
 
 // ============================================
@@ -1999,7 +1805,7 @@ bot.on('callback_query', async (cb) => {
     try {
       const turn = await mark.markTurn(chatId, '(button) I want a different title/angle — propose another one.', {
         callOpenRouter,
-        productContext: buildProductContext(),
+        productContext: await buildProductContext(),
         brandVoiceText: await brandVoice(),
         senderName: null,
       });
@@ -2639,21 +2445,12 @@ Requirements:
       const pillar = row.pillar || 'product';
       const reviewNotes = (row.review_notes || '').trim() || null;
 
-      const copywritingPrompt = buildCopywritingPrompt(topic, pillar, reviewNotes, await brandVoice());
-      const copyRaw = await callOpenRouter([
-        { role: 'system', content: copywritingPrompt },
-        { role: 'user', content: 'Generate social media content for this Fanz topic, incorporating the revision feedback.' },
-      ]);
-
-      const parsed = parseCopywritingResponse(copyRaw);
-      if (!parsed) {
-        throw new Error('Failed to parse copywriting response');
-      }
-
-      const validation = validateCopywritingResult(parsed);
-      if (!validation.valid) {
-        throw new Error(`Copywriting validation failed: ${validation.errors.join('; ')}`);
-      }
+      // ⚠️ 驳回重写是人工挑完毛病之后走的路 —— 恰恰最需要质量保障,
+      // 而 2026-08-05 之前这条路没有编造拦截、没有角度配额、不按排期日写。
+      const { parsed } = await generateCopy({
+        row, topic, pillar, reviewNotes,
+        brandVoice: await brandVoice(), callLLM: callOpenRouter,
+      });
 
       await supabase.updateContentCalendar(rowId, {
         fb_content: parsed.fb_content,
@@ -2851,16 +2648,11 @@ Requirements:
       const pillar = row.pillar || 'product';
       const reviewNotes = (row.review_notes || '').trim() || null;
 
-      const prompt = buildCopywritingPrompt(topic, pillar, reviewNotes, await brandVoice());
-      const raw = await callOpenRouter([
-        { role: 'system', content: prompt },
-        { role: 'user', content: 'Generate social media content for this Fanz topic, incorporating the revision feedback.' },
-      ]);
-      const parsed = parseCopywritingResponse(raw);
-      if (!parsed) throw new Error('Failed to parse copywriting response');
-
-      const validation = validateCopywritingResult(parsed);
-      if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
+      // 同上:批量审核里的"重写"也走统一入口
+      const { parsed } = await generateCopy({
+        row, topic, pillar, reviewNotes,
+        brandVoice: await brandVoice(), callLLM: callOpenRouter,
+      });
 
       await supabase.updateContentCalendar(rowId, {
         fb_content: parsed.fb_content,
