@@ -83,7 +83,7 @@ async function cleanup() {
   console.log('━━━ STEP 1: /plan_month (real LLM) ━━━');
 
   const target = parseTargetMonth(null);
-  const systemPrompt = buildMonthlySystemPrompt(MONTH);
+  const systemPrompt = await buildMonthlySystemPrompt(MONTH);
   const userPrompt = `Generate a full-month content calendar for July 2026 with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts.`;
   const rawResponse = await callLLM([
     { role: 'system', content: systemPrompt },

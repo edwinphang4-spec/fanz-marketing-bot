@@ -15,7 +15,7 @@ async function brandVoice() {
   try { return (await brandKitData.getBrandKit()).brand_voice || null; } catch { return null; }
 }
 const { buildMonthlySystemPrompt, parseTargetMonth } = require('./lib/monthly-planning');
-const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
+const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
 const { schedulePlan, formatScheduleTable } = require('./lib/monthly-scheduler');
 const { checkTodayPosts, buildReminderMessage } = require('./cron-publish-reminder');
@@ -682,7 +682,7 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
 
   try {
     // Step a: Build prompt and call LLM
-    const systemPrompt = buildMonthlySystemPrompt(targetMonthStr);
+    const systemPrompt = await buildMonthlySystemPrompt(targetMonthStr);
     const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
 
     const messages = [
@@ -708,6 +708,17 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
       return;
     }
 
+    // 解析器判掉/调整了哪些帖子 —— 存进 plan notes 并告知,别只在整体失效时才说。
+    // (2026-07-30:批量只出 11 篇而事后查不出原因,就是因为这段警告被丢掉了)
+    const planIssues = summarizePlanIssues(parsed, 13);
+    if (planIssues.summary) {
+      console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues.summary}`);
+      try {
+        await bot.sendMessage(chatId,
+          `ℹ️ Plan notes for ${targetMonthStr}:\n${planIssues.summary.slice(0, 1500)}`);
+      } catch (_) {}
+    }
+
     // Step c: Create content_plans row
     let planId = null;
     if (supabase.isConfigured()) {
@@ -717,7 +728,8 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
           status: 'pending_approval',
           chat_id: String(chatId),
           total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
-          notes: `Generated via /plan_month`,
+          notes: `Generated via /plan_month` +
+            (planIssues.summary ? `\n\n[parser notes]\n${planIssues.summary}` : ''),
         });
         planId = planRow.id;
         console.log(`Created content_plans row: ${planId} for ${targetMonthStr}`);
@@ -732,10 +744,24 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
     // Step d: Create content_calendar rows linked to plan
     const createdCalendarIds = [];
     if (planId && supabase.isConfigured()) {
-      for (const post of parsed.posts) {
+      // 规划时就把产品定下来（Edwin 三步方案第三步）：按素材库选品池匹配
+      // 标题里的系列/尺寸/颜色/有无灯/房间，并保证整月轮换不重复。
+      // 不定的话每一行都会掉进 pipeline 兜底，整月配图跟标题对不上。
+      let productPicks = [];
+      try {
+        productPicks = await require('./lib/pick-product').pickProductsForPlan(parsed.posts);
+      } catch (err) {
+        console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
+      }
+      // 内容角度 + 品牌事实配额:规划时一次算死整月分布（确定性算法，不问模型）。
+      // 只靠提示词说"角度要多样"是概率性的——实测 12 篇会写成同一篇的 12 个变体。
+      const angleAssignments = require('./lib/content-angles').planContentAnglesByDate(parsed.posts);
+      for (const [postIndex, post] of parsed.posts.entries()) {
         try {
           // Use DB-safe pillar (festival → story)
           const dbPillar = mapPillarForDB(post.pillar);
+          const pick = productPicks[postIndex] || null;
+          const aa = angleAssignments[postIndex] || {};
           const calRow = await supabase.createContentCalendar({
             chat_id: String(chatId),
             pillar: dbPillar,
@@ -744,6 +770,10 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
             suggested_date: post.suggested_date,
             plan_id: planId,
             status: 'planned',
+            // content_calendar 没有 angle 列，走 compose_spec（jsonb，pipeline 读它时会 merge）。
+            // is_festival 也存这里：pillar 落库会被映射成 story，写完就分不出节庆帖了。
+            compose_spec: { angle: aa.angle || null, brand_fact: aa.brandFact || null, is_festival: post.pillar === 'festival' },
+            ...(pick ? { source_product_image: pick.name } : {}),
           });
           createdCalendarIds.push(calRow.id);
         } catch (err) {
@@ -930,13 +960,48 @@ async function batchGenerateContent(chatId, planId) {
   for (let i = 0; i < approvedRows.length; i++) {
     const row = approvedRows[i];
     try {
-      const prompt = buildCopywritingPrompt(row.topic, row.pillar, undefined, await brandVoice());
-      const raw = await callOpenRouter([
-        { role: 'system', content: prompt },
-        { role: 'user', content: `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.` },
-      ]);
-      const parsed = parseCopywritingResponse(raw);
-      if (!parsed) throw new Error('Failed to parse copywriting response');
+      // 把素材库现货 + 本篇已定型号喂给文案 —— 否则文案会写出库里没有的型号,
+      // 再被提炼成图上标题(实测出现过"标题 36 吋 AURA / 画面 FS 563L")
+      const productCtx = await require('./lib/pick-product').copywritingProductContext(row);
+      // 本篇的内容角度 + 品牌事实配额（规划时算好，存在 compose_spec）。
+      // 读不到就退回不给角度约束——不阻断，但整月会缺多样性，qa 那层会报出来。
+      const rowSpec = (() => {
+        try { return typeof row.compose_spec === 'string' ? JSON.parse(row.compose_spec) : (row.compose_spec || {}); }
+        catch (_) { return {}; }
+      })();
+      const angleCtx = rowSpec.angle ? { angle: rowSpec.angle, brandFact: rowSpec.brand_fact || null } : null;
+      const prompt = buildCopywritingPrompt(
+        // suggested_date 必传:整月内容是提前排好的，用生成当天的日期写会得到
+        // "国庆快到了"排在 9 月 28 日这种常识错误（2026-08-01 干测实测）。
+        row.topic, row.pillar, undefined, await brandVoice(), productCtx, angleCtx,
+        row.suggested_date || row.scheduled_date || null
+      );
+
+      // 事实拦截:没有可核实来源的具体数字一律不许出现。提示词只能"尽量",
+      // 这里代码说了算 —— 编了就重写一次,还编就这一篇失败让人介入,
+      // 绝不把编造的数字发到 Fanz 官方账号上。
+      const { checkFabricatedClaims } = require('./lib/qa-claims');
+      const assignedMeta = productCtx && productCtx.assigned;
+      let parsed = null, claimIssues = [];
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const raw = await callOpenRouter([
+          { role: 'system', content: prompt },
+          { role: 'user', content: attempt === 1
+            ? `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.`
+            : `Generate social media content for this Fanz topic: "${row.topic}". Pillar: ${row.pillar}.\n\nYour previous attempt was rejected for stating facts we cannot verify:\n${claimIssues.join('\n')}\nRewrite it without any unverifiable number.` },
+        ]);
+        const candidate = parseCopywritingResponse(raw);
+        if (!candidate) throw new Error('Failed to parse copywriting response');
+        const claims = checkFabricatedClaims(
+          `${candidate.fb_content}\n${candidate.ig_content}`, assignedMeta
+        );
+        if (claims.ok) { parsed = candidate; break; }
+        claimIssues = claims.blocking;
+        console.warn(`[qa-claims] row ${row.id} attempt ${attempt} rejected: ${claimIssues.join(' | ')}`);
+      }
+      if (!parsed) {
+        throw new Error(`Unverifiable claims after 2 attempts: ${claimIssues.join('; ')}`);
+      }
 
       const validation = validateCopywritingResult(parsed);
       if (!validation.valid) throw new Error(`Validation failed: ${validation.errors.join('; ')}`);
@@ -956,6 +1021,40 @@ async function batchGenerateContent(chatId, planId) {
       results.push({ id: row.id, topic: row.topic, success: false, error: err.message });
       await bot.sendMessage(chatId, `❌ ${i+1}/${total}: ${row.topic} — Generation failed.`);
     }
+  }
+
+  // 整月查重 —— 代码层统计,不靠提示词祈祷。
+  // 2026-08-01 实测:上一批 12 篇里 8 篇的图上副标题一模一样、6 篇开头第一句
+  // 完全相同。这种雷同发出去一眼就是机器做的,必须在人看得到的地方报出来。
+  try {
+    const { checkMonthlyRepetition, formatRepetitionReport } = require('./lib/qa-content');
+    const { checkAngleDistribution, formatAngleReport } = require('./lib/content-angles');
+    const finalRows = await supabase.listContentCalendarByPlanId(planId);
+    const qaRows = (finalRows || []).map((r) => {
+      const spec = (() => { try { return typeof r.compose_spec === 'string' ? JSON.parse(r.compose_spec) : (r.compose_spec || {}); } catch (_) { return {}; } })();
+      return {
+        topic: r.topic,
+        pillar: spec.is_festival ? 'festival' : r.pillar,
+        angle: spec.angle || null,
+        fb_content: r.fb_content,
+        imageTexts: spec.image_texts || null,
+      };
+    });
+    const rep = checkMonthlyRepetition(qaRows);
+    // 角度分布 + 品牌事实配额:前者查代码分配的结果,后者查模型有没有听话。
+    const ang = checkAngleDistribution(qaRows);
+    const report = [formatRepetitionReport(rep), formatAngleReport(ang)].filter(Boolean).join('\n\n');
+    if (report) {
+      console.warn(`[qa-content] plan ${planId}:\n${report}`);
+      await bot.sendMessage(chatId, report);
+      try {
+        await supabasePlans.updateContentPlan(planId, {
+          notes: `[repetition check]\n${[...rep.alerts, ...ang.alerts].join('\n')}`.slice(0, 4000),
+        });
+      } catch (_) { /* notes 写不进不影响主流程 */ }
+    }
+  } catch (err) {
+    console.error('[qa-content] monthly repetition check failed:', err.message);
   }
 
   // Summary
@@ -1589,7 +1688,7 @@ bot.on('message', async (msg) => {
 
           await bot.sendMessage(chatId, `📅 Generating monthly content plan for *${targetMonthStr}*...\nThis will take a moment.`, { parse_mode: 'Markdown' });
 
-          const systemPrompt = require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
+          const systemPrompt = await require('./lib/monthly-planning').buildMonthlySystemPrompt(targetMonthStr);
           const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
 
           const rawResponse = await callOpenRouter([
@@ -1597,7 +1696,7 @@ bot.on('message', async (msg) => {
             { role: 'user', content: userPrompt },
           ], 4000);
 
-          const { parseAndValidateMonthlyPlan, mapPillarForDB } = require('./lib/monthly-plan-parser');
+          const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
           const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
 
           if (!parsed.valid || parsed.posts.length < 8) {
@@ -1613,6 +1712,16 @@ bot.on('message', async (msg) => {
             break;
           }
 
+          // 同上:有效但掉了帖子也要留痕(见 /plan_month 那处注释)
+          const planIssues2 = summarizePlanIssues(parsed, 13);
+          if (planIssues2.summary) {
+            console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues2.summary}`);
+            try {
+              await bot.sendMessage(chatId,
+                `ℹ️ Plan notes for ${targetMonthStr}:\n${planIssues2.summary.slice(0, 1500)}`);
+            } catch (_) {}
+          }
+
           let planId = null;
           if (require('./lib/supabase').isConfigured()) {
             try {
@@ -1621,7 +1730,8 @@ bot.on('message', async (msg) => {
                 status: 'pending_approval',
                 chat_id: String(chatId),
                 total_posts: parsed.regularPosts.length + parsed.festivalPosts.length,
-                notes: `Generated via intent router`,
+                notes: `Generated via intent router` +
+                  (planIssues2.summary ? `\n\n[parser notes]\n${planIssues2.summary}` : ''),
               });
               planId = planRow.id;
             } catch (err) {
@@ -1632,9 +1742,20 @@ bot.on('message', async (msg) => {
 
           const createdCalendarIds = [];
           if (planId && require('./lib/supabase').isConfigured()) {
-            for (const post of parsed.posts) {
+            // 同上:规划时按素材库选品池定产品(见另一处 /plan_month 的注释)
+            let productPicks = [];
+            try {
+              productPicks = await require('./lib/pick-product').pickProductsForPlan(parsed.posts);
+            } catch (err) {
+              console.error('[plan] product selection failed, rows will fall back at imagery time:', err.message);
+            }
+            // 同上:内容角度 + 品牌事实配额在规划时一次算死（见另一处 /plan_month）
+            const angleAssignments = require('./lib/content-angles').planContentAnglesByDate(parsed.posts);
+            for (const [postIndex, post] of parsed.posts.entries()) {
               try {
                 const dbPillar = mapPillarForDB(post.pillar);
+                const pick = productPicks[postIndex] || null;
+                const aa = angleAssignments[postIndex] || {};
                 const calRow = await require('./lib/supabase').createContentCalendar({
                   chat_id: String(chatId),
                   pillar: dbPillar,
@@ -1643,6 +1764,8 @@ bot.on('message', async (msg) => {
                   suggested_date: post.suggested_date,
                   plan_id: planId,
                   status: 'planned',
+                  compose_spec: { angle: aa.angle || null, brand_fact: aa.brandFact || null, is_festival: post.pillar === 'festival' },
+                  ...(pick ? { source_product_image: pick.name } : {}),
                 });
                 createdCalendarIds.push(calRow.id);
               } catch (err) {

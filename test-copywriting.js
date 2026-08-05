@@ -186,16 +186,27 @@ const curlyPlaceholder = {
 const v4 = validateCopywritingResult(curlyPlaceholder);
 assert(v4.valid === false, 'curly brace placeholder fails');
 
-// No Fanz keywords
+// 品牌关键词:只统计不判罚。
+// 2026-08-01 改:品牌事实改成整月配额分配后,大多数帖子本来就该一条都不提,
+// 节庆帖更是连产品都不能提 —— 旧规则("一个关键词都没有就整篇判掉")会把
+// 设计上正确的帖子判成失败。配额在整月层面由 content-angles 校验。
 const noKeywords = {
   fb_content: 'This is a generic post about home products with no brand-specific details.',
   ig_content: 'Today is a beautiful day to relax at home.',
   hashtags: '#post #random #home',
 };
 const v5 = validateCopywritingResult(noKeywords);
-assert(v5.valid === false, 'no Fanz keywords fails');
-assert(v5.errors.some(e => e.includes('keyword')), 'keyword error reported');
+assert(v5.valid === true, 'no brand keyword is NOT a failure any more');
+assert(v5.errors.every(e => !e.includes('keyword')), 'no keyword error reported');
 assert(v5.keywordsHit.length === 0, 'zero keywords hit');
+
+// 节庆纯祝福帖(Fanz 自己的真实写法)必须能通过校验
+const festivalGreeting = {
+  fb_content: 'May the holy month of Muharram bring you faith, peace, and strength.',
+  ig_content: 'May the holy month of Muharram bring you faith, peace, and strength.',
+  hashtags: '#FANZ #Fanz #Muharram',
+};
+assert(validateCopywritingResult(festivalGreeting).valid === true, 'pure festival greeting passes validation');
 
 // ============================================
 // 4. FORBIDDEN_PLACEHOLDER_PATTERNS list

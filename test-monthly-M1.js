@@ -74,20 +74,40 @@ assert(textParse.monthName === 'August', `parseTargetMonth('August 2026') monthN
 assert(textParse.year === 2026, `parseTargetMonth('August 2026') year = ${textParse.year}`);
 assert(textParse.monthIndex === 7, `parseTargetMonth('August 2026') monthIndex = ${textParse.monthIndex}`);
 
-console.log('\n=== UNIT: buildMonthlySystemPrompt ===');
+// buildMonthlySystemPrompt 2026-07-30 起是 async（产品系列改从素材库选品池读），
+// 所以这段单元断言挪进函数，由下面的 async 主流程调用。
+async function checkPromptUnit() {
+  console.log('\n=== UNIT: buildMonthlySystemPrompt ===');
 
-const prompt = buildMonthlySystemPrompt(TARGET_MONTH_STR);
-assert(prompt.includes('July 2026'), 'prompt contains target month string');
-assert(prompt.includes('exactly 12 regular posts'), 'prompt specifies 12 regular posts');
-assert(prompt.includes('product: 4'), 'prompt specifies product: 4');
-assert(prompt.includes('case: 3'), 'prompt specifies case: 3');
-assert(prompt.includes('educational: 2'), 'prompt specifies educational: 2');
-assert(prompt.includes('story: 2'), 'prompt specifies story: 2');
-assert(prompt.includes('promo: 1'), 'prompt specifies promo: 1');
-assert(prompt.includes('festival'), 'prompt mentions festival posts');
-assert(prompt.includes('JSON'), 'prompt demands JSON output');
-assert(prompt.includes('FS Series') && prompt.includes('Grande L Series'), 'prompt includes product series');
-assert(prompt.includes('SIRIM'), 'prompt includes brand identity');
+  const prompt = await buildMonthlySystemPrompt(TARGET_MONTH_STR);
+  assert(prompt.includes('July 2026'), 'prompt contains target month string');
+  assert(prompt.includes('exactly 12 regular posts'), 'prompt specifies 12 regular posts');
+  assert(prompt.includes('product: 4'), 'prompt specifies product: 4');
+  assert(prompt.includes('case: 3'), 'prompt specifies case: 3');
+  assert(prompt.includes('educational: 2'), 'prompt specifies educational: 2');
+  assert(prompt.includes('story: 2'), 'prompt specifies story: 2');
+  assert(prompt.includes('promo: 1'), 'prompt specifies promo: 1');
+  assert(prompt.includes('festival'), 'prompt mentions festival posts');
+  assert(prompt.includes('JSON'), 'prompt demands JSON output');
+  // 现货系列名（FS/GAZE/FERRO/GRANDE 之一必现）——不再断言已下架的 "Grande L Series"
+  assert(/\b(FS|GAZE|FERRO|GRANDE) Series\b/.test(prompt), 'prompt includes in-pool product series');
+  assert(prompt.includes('SIRIM'), 'prompt includes brand identity');
+  // 关键回归:计划器不许把选品池外的系列当成"可用产品"列出来（否则配图必然对不上）。
+  // 注意别误判——禁止清单本身会提到这些名字，所以断言要看"是否被列为可用项"。
+  assert(!/^- Smart Series/m.test(prompt), 'Smart Series is not listed as an available series');
+  // 2026-08-04 更新:AURA / INNO 当初被排除是因为**规格未确认、没有产品图**,
+  // 不是因为它们不存在。Fanz 官方清单确认了规格(AURA 3 TONE LED、
+  // INNO435L 43" / INNO525L 52"),清单里内嵌的产品照也建进库了 → 现在是合法可用系列。
+  // 真正该守的红线没变:选品池里没有素材的系列不许列出来。
+  assert(/^- AURA Series/m.test(prompt), 'AURA 现在有素材有规格,应列为可用系列');
+  assert(/^- INNO Series/m.test(prompt), 'INNO 现在有素材有规格,应列为可用系列');
+  // VIOZ 是另一个品牌(5 年保修、无 WiFi),永远不该出现在 Fanz 的可用系列里
+  assert(!/^- (VETTA|WINDY|AXEL|FF\d) /m.test(prompt), 'VIOZ 系列不出现在 Fanz 可用清单里');
+  // 池里没有素材的型号也不许列(SPINOR 是角扇、已移出池)
+  assert(!/^- SPINOR Series/m.test(prompt), 'SPINOR(角扇,已移出池)不列为可用系列');
+  assert(/do NOT (?:name, imply, or invent|mention)/i.test(prompt), 'prompt forbids inventing other series');
+  assert(/Never claim WiFi/i.test(prompt), 'prompt forbids unverified WiFi claims');
+}
 
 console.log('\n=== UNIT: parseAndValidateMonthlyPlan ===');
 
@@ -262,9 +282,11 @@ async function callOpenRouter(messages) {
 
 (async () => {
   try {
+    await checkPromptUnit();
+
     // Step 1: Call LLM with monthly planning prompt
     console.log('  Calling OpenRouter with monthly planning prompt...');
-    const systemPrompt = buildMonthlySystemPrompt(TARGET_MONTH_STR);
+    const systemPrompt = await buildMonthlySystemPrompt(TARGET_MONTH_STR);
     const userPrompt = `Generate a full-month content calendar for ${TARGET_MONTH_STR} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
 
     const messages = [
