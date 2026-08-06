@@ -2827,6 +2827,15 @@ async function sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, re
         { text: '📤 Upload Own', callback_data: cb('image_upload_own',rowId) },
         { text: '⏭️ Skip Image', callback_data: cb('image_skip',rowId) },
       ],
+      // 去 Canva 手动微调 —— 纯跳转,不接 API(2026-08-06)。
+      // 我们的图是 gpt-image-2 出的扁平 PNG,没有图层也没有文字对象,
+      // 导进 Canva 只是一张背景图,"把标题字号调小"这种根本改不了。
+      // 所以不做往返同步,只给一条明确的路:图就在上面这条消息里(长按保存)→
+      // 在 Canva 手动加东西盖住/调版 → 存下来 → 回来点「Upload Own」传回。
+      // 她本来就能这么做,只是不知道可以。
+      [
+        { text: '🎨 去 Canva 微调', url: 'https://www.canva.com/create/instagram-posts/' },
+      ],
     ],
   };
 
