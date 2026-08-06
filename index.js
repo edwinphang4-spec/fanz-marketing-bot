@@ -413,6 +413,10 @@ if (!SKIP_BOT_INIT) {
       sendImageReviewCard(chatId, rowId, imageUrl, status, isDryRun, retryCount),
     sendVideoReviewCard: (chatId, rowId, videoUrl, topic) =>
       sendVideoReviewCard(chatId, rowId, videoUrl, topic),
+    // 带意见重写 —— worker 认领 Dashboard 驳回的行后回调这里。
+    // 放在 index.js 是因为 callOpenRouter / brandVoice 在这边;
+    // 但生成本身仍然走 generateCopy 这**唯一**入口,不另起一份。
+    rewriteCopy: (row) => rewriteCopyWithFeedback(row),
   });
 }
 
@@ -1254,6 +1258,44 @@ function buildTitleDraftCard(d) {
   return lines.join('\n');
 }
 
+/**
+ * 带意见重写一篇 —— Dashboard 驳回后由 worker 回调。
+ *
+ * 意见**不清空**:Edwin 定的规矩是批准时才清,这样第三次重写能看到全部三条,
+ * 模型才能看出"她一直不满意的是同一个点"。
+ */
+async function rewriteCopyWithFeedback(row) {
+  const topic = row.topic || 'Fanz ceiling fan promotion';
+  const pillar = row.pillar || 'product';
+  const reviewNotes = (row.review_notes || '').trim() || null;
+  const previousVersion = row.fb_content || row.ig_content || null;
+
+  const { parsed } = await generateCopy({
+    row, topic, pillar, reviewNotes, previousVersion,
+    brandVoice: await brandVoice(), callLLM: callOpenRouter,
+  });
+
+  // rejected → copy_done 是状态机里本来就有的边
+  await supabase.updateContentCalendar(row.id, {
+    fb_content: parsed.fb_content,
+    ig_content: parsed.ig_content,
+    hashtags: parsed.hashtags,
+    status: 'copy_done',
+  });
+
+  if (row.chat_id) {
+    const n = require('./lib/review-notes').noteCount(reviewNotes);
+    try {
+      await bot.sendMessage(row.chat_id,
+        `✏️ 已按你的意见改好:「${topic}」${n ? `(第 ${n} 次修改)` : ''}\n` +
+        `去 Dashboard 看新版本:${DASHBOARD_URL}/marketing`);
+    } catch (err) {
+      console.error('[rewrite] 通知发送失败(不影响重写结果):', err.message);
+    }
+  }
+  return { ok: true };
+}
+
 // 单篇流：建 calendar 行 → 现有 copywriting 管线 → 现有审批卡。
 // 之后的 approve 按钮（review_approve）沿用现有出图链路，零新机制。
 async function runSinglePostFromDraft(chatId, draft) {
@@ -1446,7 +1488,10 @@ bot.on('message', async (msg) => {
     const { rowId } = awaitingReviewNotes.get(chatId);
     const trimmedText = (text || '').trim() || '(no specific notes)';
     try {
-      await supabase.updateContentCalendar(rowId, buildRejectPayload(trimmedText));
+      // 追加不覆盖(2026-08-06)——和 Dashboard、批量审核统一成同一套账本
+      const cur = await supabase.getContentCalendar(rowId);
+      const merged = require('./lib/review-notes').appendNote(cur && cur.review_notes, trimmedText);
+      await supabase.updateContentCalendar(rowId, buildRejectPayload(merged));
       awaitingReviewNotes.delete(chatId);
       await bot.sendMessage(
         chatId,
@@ -1474,7 +1519,11 @@ bot.on('message', async (msg) => {
     const trimmedText = (text || '').trim() || '(no specific notes)';
     try {
       // Set review_notes on the row; keep status as copy_done for regeneration
-      await supabase.updateContentCalendar(rowId, { review_notes: trimmedText });
+      const cur = await supabase.getContentCalendar(rowId);
+      // 追加不覆盖 —— 她连驳三次时,第三次重写要能看到全部三条(2026-08-06)
+      await supabase.updateContentCalendar(rowId, {
+        review_notes: require('./lib/review-notes').appendNote(cur && cur.review_notes, trimmedText),
+      });
       awaitingBatchReviewNotes.delete(chatId);
       await bot.sendMessage(
         chatId,
@@ -1849,7 +1898,7 @@ bot.on('callback_query', async (cb) => {
     const rowId = data.slice('review_approve:'.length);
     try {
       // Step 2d: Copy approved → copy_approved (not 'approved' anymore — imagery phase follows)
-      await supabase.updateContentCalendar(rowId, { status: 'copy_approved' });
+      await supabase.updateContentCalendar(rowId, { status: 'copy_approved', review_notes: null });
       await bot.answerCallbackQuery(cb.id, { text: '✅ Copy approved — generating imagery...' });
       const originalText = (message && message.text) || '';
       await bot.editMessageText(originalText + '\n\n✅ Copy Approved\n⏳ Generating imagery...', {
@@ -2576,7 +2625,7 @@ Requirements:
     const rowId = data.slice('ba:'.length);
     const planId = await resolvePlanId(batchActionMap, rowId);
     try {
-      await supabase.updateContentCalendar(rowId, { status: 'copy_approved' });
+      await supabase.updateContentCalendar(rowId, { status: 'copy_approved', review_notes: null });
       await bot.answerCallbackQuery(cb.id, { text: '✅ Copy approved!' });
       // Refresh the batch review card
       try {
@@ -2628,7 +2677,7 @@ Requirements:
       let failCount = 0;
       for (const row of pendingRows) {
         try {
-          await supabase.updateContentCalendar(row.id, { status: 'copy_approved' });
+          await supabase.updateContentCalendar(row.id, { status: 'copy_approved', review_notes: null });
           successCount++;
         } catch (err) {
           console.error(`batch_approve_all: row ${row.id} failed:`, err.message);
@@ -2683,7 +2732,9 @@ Requirements:
         ig_content: parsed.ig_content,
         hashtags: parsed.hashtags,
         status: 'copy_done',
-        review_notes: null,
+        // 2026-08-06:这里原本把意见清成 null —— 于是第二次驳回时,第一条意见
+        // 已经不见了。单篇那条路又是"用完不清",两边行为不一致。
+        // 统一成:意见留着累积,**只在批准时清**。
       });
 
       await bot.sendMessage(chatId, `🔄 Regenerated: ${topic}`);
