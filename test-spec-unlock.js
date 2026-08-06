@@ -50,8 +50,18 @@ assert(real.length >= 4, `清单能算出 ${real.length} 对真实配对`);
 assert(real.every((c) => c.more.blades > c.fewer.blades && c.more.cfm > c.fewer.cfm),
   '每一对都是叶更多且风量确实更高(反例不硬凑成结论)');
 assert(new Set(real.map((c) => c.size)).size >= 4, '覆盖至少 4 个尺寸段');
-assert(ok('5 blades move 33% more air than 3 at the same size.'), '33% 对得上 52 吋那对 → 放行');
-assert(!ok('5 blades move 80% more air than 3.'), '80% 对不上任何一对 → 拦');
+// 2026-08-06 规则收紧(不是为了让测试变绿):对比必须**点名两台**才放行。
+// 起因是实测那篇 —— 文案写 "GAZE52N 7,539 CFM vs INNO525L 10,000 CFM" 被拦,
+// 因为拦截器只认本篇这一台。修的时候把放行条件定成"型号名要出现在文里",
+// 于是反过来,不点名的裸百分比/裸叶数也不再放行了。这和提示词里那句
+// "A bare '5 blades move X% more air' with no models behind it is not something
+// we can stand behind" 是同一条标准 —— 读者要能自己核。
+assert(ok('At 56", the 6-blade DELTA56 moves 29% more air than the 3-blade FS563L.'),
+  '点名两台 + 29% 对得上清单配对 → 放行', why('At 56", the 6-blade DELTA56 moves 29% more air than the 3-blade FS563L.'));
+assert(!ok('5 blades move 33% more air than 3 at the same size.'),
+  '不点名的裸对比 → 拦(读者没法核)');
+assert(!ok('At 56", the 6-blade DELTA56 moves 80% more air than the 3-blade FS563L.'),
+  '点名了但 80% 对不上清单 → 仍然拦');
 assert(!ok('7 blades move more air than 3 at the same size.'),
   '凭空说 7 叶(56 吋没有 7 叶的扇)→ 仍然拦');
 assert(ok('Six blades instead of three moves noticeably more air.'),
