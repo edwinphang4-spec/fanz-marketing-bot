@@ -1248,9 +1248,26 @@ async function runSinglePostFromDraft(chatId, draft) {
         `素材库里没有「${draft.product}」这台,我不会拿别的型号顶替。\n换一个型号,或者不指定型号让我从库里挑。`);
       return null;
     }
-    if (!resolved.exactModel || (resolved.colourAsked && !resolved.colourMatched)) {
+    // ── 只说了系列名 → 问她是哪一台,不要替她挑 ──
+    //
+    // 2026-08-08 Edwin 收紧:她说"推 DELTA",系统在 DELTA56(56 吋)和 DELTA66(66 吋)
+    // 之间挑了一台。这两台**适合的空间完全不同** —— 挑到 66 吋(大客厅/商用),
+    // 而她想的是 56 吋,整篇内容的方向就偏了。
+    // 之前的做法是挑一台再告诉她"最接近的是 X" —— 不算静默替换,但她要发现不对
+    // 得读完那行提示,而多数人不会读。**能问就问**,和它对 AURA 的做法一致。
+    if (!resolved.exactModel && resolved.alternatives.length) {
+      const options = [resolved.name, ...resolved.alternatives];
+      const models = [...new Set(options.map((n) => String(n).split(/\s+(?=Matte|Matt|Oak|Pine|Grey|Gray)/)[0]))];
       await bot.sendMessage(chatId,
-        `库里没有完全对上「${draft.product}」,最接近的是 ${resolved.name},就用这台。`);
+        models.length > 1
+          ? `「${draft.product}」有 ${models.length} 个型号：${models.join(' / ')}。\n你想推哪一个？`
+          : `「${draft.product}」有几个颜色：${options.join(' / ')}。\n你想用哪一个？`);
+      mark.markNote(chatId, `[system note: the user named only a series ("${draft.product}"), which maps to more than one model (${models.join(', ')}). Ask her which one, then re-issue title_draft with that exact model. Do not pick one yourself — models in a series differ in diameter and suit different rooms.]`);
+      return null;
+    }
+    if (resolved.colourAsked && !resolved.colourMatched) {
+      await bot.sendMessage(chatId,
+        `库里没有「${draft.product}」那个颜色,最接近的是 ${resolved.name},就用这台。`);
     }
   }
 
