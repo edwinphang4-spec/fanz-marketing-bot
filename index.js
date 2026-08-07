@@ -17,7 +17,7 @@ const { publishToSocial } = require('./lib/publish');
 async function brandVoice() {
   try { return (await brandKitData.getBrandKit()).brand_voice || null; } catch { return null; }
 }
-const { buildMonthlySystemPrompt, parseTargetMonth } = require('./lib/monthly-planning');
+const { buildMonthlySystemPrompt, buildContentPlanPrompt, parseTargetMonth } = require('./lib/monthly-planning');
 const { parseAndValidateMonthlyPlan, mapPillarForDB, summarizePlanIssues } = require('./lib/monthly-plan-parser');
 const { isFestivalPost, getFestiveSceneDescription } = require('./lib/festival-handler');
 const { schedulePlan, formatScheduleTable } = require('./lib/monthly-scheduler');
@@ -696,20 +696,27 @@ async function reshowMonthCalendar(chatId, planId) {
 // ============================================
 // /plan_month — Monthly content planning
 // ============================================
-bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const userInput = match[1] ? match[1].trim() : null;
+/**
+ * 生成一批内容 —— /plan_month 命令和 Mark 的 make_content 共用这一条路。
+ * @param {number|string} chatId
+ * @param {object} req content-request.buildRequest() 的产物(整月用 monthRequest())
+ */
+async function runContentPlan(chatId, req) {
+  // 2026-08-08:整月不再是唯一形态。这一段收 request 对象({count,from,to,...}),
+  // 「整月」只是 monthRequest() 造出来的一个特例 —— **内部只有这一条路**。
+  // 保留两套实现的话,"整月"和"N 篇"会慢慢漂开(和之前"新逻辑只接了月度批量"
+  // 是同一个病),所以 /plan_month 命令和 Mark 的 make_content 都走这里。
+  const { describeRequest } = require('./lib/content-request');
+  const targetMonthStr = req.monthLabel || req.label || `${req.from} ~ ${req.to}`;
 
-  // Determine target month
-  const target = parseTargetMonth(userInput);
-  const targetMonthStr = target.monthStr;
-
-  await bot.sendMessage(chatId, `📅 Generating monthly content plan for *${targetMonthStr}*...\nThis will take a moment.`, { parse_mode: 'Markdown' });
+  // 算出来的数量和日期必须**当场显示**给她。"下星期"本身有歧义(周一起还是周日起?),
+  // 她说"几篇"我理解成 3、她以为 5 —— 这些误会只有写出来才拦得住。
+  await bot.sendMessage(chatId, `📅 开始规划：${describeRequest(req)}\n稍等一下…`);
 
   try {
     // Step a: Build prompt and call LLM
-    const systemPrompt = await buildMonthlySystemPrompt(targetMonthStr);
-    const userPrompt = `Generate a full-month content calendar for ${targetMonthStr} with exactly 12 regular posts (4 product, 3 case, 2 educational, 2 story, 1 promo) plus 0-2 festival posts. Ensure all product series are featured.`;
+    const systemPrompt = await buildContentPlanPrompt(req);
+    const userPrompt = `Generate the content calendar described in your brief: exactly ${req.count} regular post(s), every suggested_date between ${req.from} and ${req.to}. Follow the pillar counts given. Ensure the product series are varied.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -719,7 +726,7 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
     const rawResponse = await callOpenRouter(messages, 4000);
 
     // Step b: Parse and validate
-    const parsed = parseAndValidateMonthlyPlan(rawResponse, targetMonthStr);
+    const parsed = parseAndValidateMonthlyPlan(rawResponse, req);
 
     if (!parsed.valid || parsed.posts.length < 8) {
       let detail = '';
@@ -736,7 +743,7 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
 
     // 解析器判掉/调整了哪些帖子 —— 存进 plan notes 并告知,别只在整体失效时才说。
     // (2026-07-30:批量只出 11 篇而事后查不出原因,就是因为这段警告被丢掉了)
-    const planIssues = summarizePlanIssues(parsed, 13);
+    const planIssues = summarizePlanIssues(parsed, req.count + 1);
     if (planIssues.summary) {
       console.warn(`[plan] ${targetMonthStr} 解析异常:\n${planIssues.summary}`);
       try {
@@ -827,6 +834,12 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
     console.error('/plan_month error:', err);
     await bot.sendMessage(chatId, userMessage(err, 'Error generating monthly plan. Please try /plan_month again.'));
   }
+}
+
+// 旧命令保留 —— 内部转成 request 走同一条路(不是第二套实现)
+bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
+  const target = parseTargetMonth(match[1] ? match[1].trim() : null);
+  await runContentPlan(msg.chat.id, require('./lib/monthly-planning').monthRequest(target.monthStr));
 });
 
 // ============================================
@@ -1654,12 +1667,23 @@ bot.on('message', async (msg) => {
     if (turn.action === 'title_draft' && turn.data && turn.data.title) {
       pendingTitleDrafts.set(chatId, turn.data);
       await bot.sendMessage(chatId, buildTitleDraftCard(turn.data), { reply_markup: buildMarkDraftKeyboard() });
-    } else if (turn.action === 'plan_month') {
-      // 明确要整月 → 复用现有 /plan_month 命令的完整流程
-      bot.processUpdate({
-        update_id: Date.now(),
-        message: { ...msg, text: '/plan_month', entities: [{ type: 'bot_command', offset: 0, length: 11 }] },
+    } else if (turn.action === 'make_content' && turn.data) {
+      // 任意数量 + 任意日期范围。"整月"只是它的特例 —— 同一条路。
+      const { buildRequest, describeRequest } = require('./lib/content-request');
+      const d = turn.data;
+      const built = buildRequest({
+        count: d.count, when: d.when,
+        products: d.products, pillars: d.pillars, theme: d.theme,
       });
+      if (!built.ok) {
+        // 缺数量/缺日期 —— 不替她填默认值,问一句。
+        // 猜错的代价不对等:整月要烧 ~50 分钟和真金白银。
+        await bot.sendMessage(chatId, built.need === 'count'
+          ? '要几篇？告诉我数量我就开始。'
+          : '这批要排在什么时候？可以说"这个星期""下个月"，或者直接给日期。');
+      } else {
+        await runContentPlan(chatId, built.request);
+      }
     } else if (turn.action === 'set_copy') {
       await applyPastedCopy(chatId);
     }
