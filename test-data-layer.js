@@ -117,8 +117,22 @@ assertDoesNotThrow(() => sm.transition('draft', 'planning_done'), 'draft → pla
 assertDoesNotThrow(() => sm.transition('planning_done', 'selected'), 'planning_done → selected legal');
 assertDoesNotThrow(() => sm.transition('selected', 'copy_done'), 'selected → copy_done legal');
 assertDoesNotThrow(() => sm.transition('copy_done', 'pending_review'), 'copy_done → pending_review legal');
-assertDoesNotThrow(() => sm.transition('pending_review', 'approved'), 'pending_review → approved legal');
+// 2026-08-06 改:原本断言 pending_review → approved 合法。那是**配图阶段插进来之前**
+// 的流程。现在文案批准只到 copy_approved,后面还有出图 → image_ready → approved;
+// 直接跳到 approved 等于产出一篇没有图的帖子。想只发文案的escape hatch在
+// copy_approved → approved 那条边上,不在这里。机器是对的,断言过时了。
+assertDoesNotThrow(() => sm.transition('pending_review', 'copy_approved'), 'pending_review → copy_approved legal (文案批准,进配图阶段)');
+assertThrows(() => sm.transition('pending_review', 'approved'), 'pending_review → approved illegal (不能跳过配图直接可发布)');
 assertDoesNotThrow(() => sm.transition('pending_review', 'rejected'), 'pending_review → rejected legal');
+// 2026-08-06 新增:Dashboard 的「Request Changes」就是从 copy_done 驳回的。
+// 这条边补上之前,线上跑得通但状态机说它非法(装部署探针时才发现)。
+assertDoesNotThrow(() => sm.transition('copy_done', 'rejected'), 'copy_done → rejected legal (Dashboard 驳回)');
+assertDoesNotThrow(() => sm.transition('copy_done', 'copy_approved'), 'copy_done → copy_approved legal (Dashboard 直接批准,不经 Telegram 卡片)');
+// 配图阶段的边 —— 这份测试写在配图阶段之前,一直没覆盖到
+assertDoesNotThrow(() => sm.transition('copy_approved', 'image_ready'), 'copy_approved → image_ready legal');
+assertDoesNotThrow(() => sm.transition('copy_approved', 'approved'), 'copy_approved → approved legal (跳过配图,只发文案)');
+assertDoesNotThrow(() => sm.transition('image_ready', 'image_retry'), 'image_ready → image_retry legal (重出图)');
+assertDoesNotThrow(() => sm.transition('image_retry', 'approved'), 'image_retry → approved legal (重试到上限后的出口)');
 assertDoesNotThrow(() => sm.transition('approved', 'published'), 'approved → published legal');
 assertDoesNotThrow(() => sm.transition('rejected', 'copy_done'), 'rejected → copy_done legal (re-do path)');
 
@@ -164,16 +178,35 @@ function sameSet(a, b) {
   return sa.every((v, i) => v === sb[i]);
 }
 
+// 2026-08-06 全表复核。改的每一条都是**测试落后于架构**，不是为了让它变绿:
+//   draft/selected 多出 'planned' —— 月度计划流建行时直接落 planned;
+//   copy_done 多出 'copy_approved' —— Dashboard 可以直接批准,不经 Telegram 卡片;
+//   copy_done 多出 'rejected'     —— Dashboard 的 Request Changes(50d9cda 加的);
+//   pending_review 的 'approved' → 'copy_approved' —— 配图阶段插在中间了。
+// 顺带把配图那几个状态补进来:这份表原本到 pending_review 就没了,
+// copy_approved/image_ready/image_retry 三个状态一条断言都没有。
 const expected = {
-  draft: ['planning_done', 'selected'],
+  draft: ['planning_done', 'selected', 'planned'],
   planning_done: ['selected'],
-  selected: ['copy_done'],
-  copy_done: ['pending_review'],
-  pending_review: ['approved', 'rejected'],
+  selected: ['planned', 'copy_done'],
+  planned: ['plan_approved'],
+  plan_approved: ['copy_done'],
+  copy_done: ['pending_review', 'copy_approved', 'rejected'],
+  pending_review: ['copy_approved', 'rejected'],
+  copy_approved: ['image_ready', 'approved'],
+  image_ready: ['approved', 'image_retry'],
+  image_retry: ['image_ready', 'approved'],
   approved: ['published'],
   rejected: ['copy_done'],
   published: [],
 };
+
+// 这张表必须覆盖每一个状态 —— 漏掉的状态等于没人看着它的边。
+// (配图那三个状态就是这么漏了大半年的。)
+for (const s of sm.STATES) {
+  assert(Object.prototype.hasOwnProperty.call(expected, s),
+    `状态 "${s}" 在期望表里有一行(新增状态时别忘了补)`);
+}
 
 for (const [from, want] of Object.entries(expected)) {
   const got = sm.allowedTransitions(from);
@@ -190,10 +223,20 @@ assert(!fresh.includes('hacked'), 'allowedTransitions returns a fresh copy (muta
 // 8. nextStatus — happy-path forward
 // ============================================
 console.log('\n--- nextStatus ---');
-assert(sm.nextStatus('draft') === 'planning_done', 'nextStatus(draft) = planning_done');
+// 2026-08-06 改写这一段的**测法**,不只是改数值。
+//
+// 原来这里逐个写死 nextStatus(selected) === 'copy_done' 之类。nextStatus 的实现
+// 就是"取 allowedTransitions 的第一个",所以这些断言锁的是**数组顺序**——
+// 谁为了可读性把 TRANSITIONS 里两条边换个位置,测试就红,而行为一点没变。
+// 而且查过:nextStatus 在生产代码里**一个调用点都没有**(只有这份测试用它)。
+// 锁一个没人用的函数的顺序细节,正是"长期红→习惯性忽略"的来源。
+//
+// 改成断言它的**契约**(返回第一条合法边;终态返回 null),这样契约不变就不会红。
+for (const s of sm.STATES) {
+  const want = sm.allowedTransitions(s)[0] ?? null;
+  assert(sm.nextStatus(s) === want, `nextStatus("${s}") = 第一条合法边 (${want})`);
+}
 assert(sm.nextStatus('planning_done') === 'selected', 'nextStatus(planning_done) = selected');
-assert(sm.nextStatus('selected') === 'copy_done', 'nextStatus(selected) = copy_done');
-assert(sm.nextStatus('copy_done') === 'pending_review', 'nextStatus(copy_done) = pending_review');
 assert(sm.nextStatus('approved') === 'published', 'nextStatus(approved) = published');
 assert(sm.nextStatus('rejected') === 'copy_done', 'nextStatus(rejected) = copy_done');
 assert(sm.nextStatus('published') === null, 'nextStatus(published) = null (terminal)');
