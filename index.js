@@ -151,16 +151,20 @@ const batchActionMap = new Map();
 // cleared after their next photo is received and processed.
 const awaitingImageUpload = new Map();
 
-// Map<calId, planId> — for monthly calendar action callbacks (short format < 64 bytes)
-const monthActionMap = new Map();
+// (monthActionMap 已删 —— 它只服务于逐篇的 me/mr/mrp 按钮,那三个按钮
+//  2026-08-07 随「整体确认」卡片一起去掉了。batchActionMap 仍在用。)
 
 // Map<chatId, { rowId }> — set when user clicks "Change Scene" on an image review card,
 // cleared after their next text message is consumed as the new scene description.
 const awaitingSceneChange = new Map();
 
+// Map<chatId, planId> — 点了「💬 我有想法要调整」之后,她下一句话说的是要改计划哪里。
+// 不拦截她的输入(那会把 Mark 变成填空题),只是给 Mark 一个"她在说计划"的上下文。
+const pendingPlanTweak = new Map();
+
 /**
  * Resolve the planId for a calendar row.
- * monthActionMap/batchActionMap are in-memory and lost on restart, so old
+ * batchActionMap is in-memory and lost on restart, so old
  * inline buttons would resolve to '' and half-fail after a redeploy.
  * Fallback: the row itself carries plan_id in the DB.
  */
@@ -659,61 +663,21 @@ async function buildMonthCalendarMessage(planId) {
   // Only include active posts (not rejected unless we want to show them)
   const activeRows = rows.filter(r => r.status !== 'rejected');
 
-  // Sort by suggested_date
-  const sorted = [...activeRows].sort((a, b) => (a.suggested_date || '').localeCompare(b.suggested_date || ''));
-
-  // Group by week
-  const weeks = [];
-  let currentWeek = [];
-  let currentWeekNum = null;
-
-  for (const row of sorted) {
-    const d = new Date((row.suggested_date || '') + 'T00:00:00+08:00');
-    const startOfYear = new Date(d.getFullYear(), 0, 1);
-    const weekNum = Math.ceil((((d - startOfYear) / 86400000) + startOfYear.getDay() + 1) / 7);
-
-    if (currentWeekNum !== null && weekNum !== currentWeekNum) {
-      weeks.push(currentWeek);
-      currentWeek = [];
-    }
-    currentWeekNum = weekNum;
-    currentWeek.push(row);
-  }
-  if (currentWeek.length > 0) {
-    weeks.push(currentWeek);
-  }
-
-  let output = `📅 *Monthly Content Plan — ${plan.month}*\n\n`;
-  output += `*Status:* ${plan.status} | *Posts:* ${activeRows.length}/${plan.total_posts || activeRows.length}\n\n`;
-
-  for (const week of weeks) {
-    output += `━━━ *Week* ━━━\n`;
-    for (const row of week) {
-      const emoji = PILLAR_EMOJI_MONTHLY[row.pillar] || '📝';
-      const dateFormatted = (row.suggested_date || '').replace(/^\d{4}-/, '');
-      output += `${dateFormatted} ${emoji} *${row.topic}*\n`;
-      output += `   _${row.pillar}_ — ${row.post_angle || ''}\n\n`;
-    }
-  }
-
-  // Build inline keyboard with per-post action buttons
-  const keyboard = [];
-  for (const row of sorted) {
-    const shortTopic = (row.topic || '').length > 30
-      ? (row.topic || '').slice(0, 27) + '...'
-      : (row.topic || '');
-    monthActionMap.set(row.id, planId);
-    keyboard.push([
-      { text: `✏️ ${shortTopic}`, callback_data: cb('me',row.id) },
-      { text: `❌ Remove`, callback_data: cb('mr',row.id) },
-      { text: `🔄 Replace`, callback_data: cb('mrp',row.id) },
-    ]);
-  }
-  keyboard.push(
-    [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
-  );
-
-  return { text: output, keyboard: { inline_keyboard: keyboard } };
+  // 2026-08-07:整段换成 buildPlanCard —— 旧版是 12 篇 × 3 个按钮,而按钮上的
+  // 标题被截到 27 字,同一份信息在正文和按钮里各出现一次(一次完整一次残缺)。
+  // 详见 lib/plan-summary.js 顶部。
+  const { buildPlanCard } = require('./lib/plan-summary');
+  const { seriesOf } = require('./lib/pick-product');
+  const picks = activeRows.map((r) => (r.source_product_image
+    ? { series: seriesOf({ metadata: { catalog_model: r.source_product_image } }) }
+    : null));
+  const { text, keyboard } = buildPlanCard({
+    posts: activeRows,
+    picks,
+    monthLabel: plan.month,
+    planId,
+  });
+  return { text, keyboard };
 }
 
 async function reshowMonthCalendar(chatId, planId) {
@@ -846,78 +810,18 @@ bot.onText(/^\/plan_month(?:\s+(.*))?$/is, async (msg, match) => {
       console.log(`Created ${createdCalendarIds.length}/${parsed.posts.length} content_calendar rows for plan ${planId}`);
     }
 
-    // Step e: Build and send calendar overview message with per-post buttons
-    const sortedPosts = [...parsed.posts].sort((a, b) => a.suggested_date.localeCompare(b.suggested_date));
-
-    // Group by week
-    const weeks = [];
-    let currentWeek = [];
-    let currentWeekNum = null;
-
-    for (const post of sortedPosts) {
-      const d = new Date(post.suggested_date + 'T00:00:00+08:00');
-      const startOfYear = new Date(d.getFullYear(), 0, 1);
-      const weekNum = Math.ceil((((d - startOfYear) / 86400000) + startOfYear.getDay() + 1) / 7);
-
-      if (currentWeekNum !== null && weekNum !== currentWeekNum) {
-        weeks.push(currentWeek);
-        currentWeek = [];
-      }
-      currentWeekNum = weekNum;
-      currentWeek.push(post);
-    }
-    if (currentWeek.length > 0) {
-      weeks.push(currentWeek);
-    }
-
-    let output = `📅 *Monthly Content Plan — ${targetMonthStr}*\n\n`;
-    output += `*Pillar Breakdown:*\n`;
-    for (const [p, count] of Object.entries(parsed.pillarCounts)) {
-      if (p === 'festival') continue;
-      output += `${PILLAR_EMOJI_MONTHLY[p] || '📝'} ${p}: ${count}\n`;
-    }
-    if (parsed.festivalPosts.length > 0) {
-      output += `${PILLAR_EMOJI_MONTHLY.festival} festival: ${parsed.festivalPosts.length}\n`;
-    }
-    output += `\n`;
-
-    for (const week of weeks) {
-      output += `━━━ *Week* ━━━\n`;
-
-      for (const post of week) {
-        const emoji = PILLAR_EMOJI_MONTHLY[post.pillar] || '📝';
-        const dateFormatted = post.suggested_date.replace(/^\d{4}-/, '');
-        output += `${dateFormatted} ${emoji} *${post.topic}*\n`;
-        output += `   _${post.pillar}_ — ${post.post_angle}\n\n`;
-      }
-    }
-
-    output += `✅ *${parsed.regularPosts.length} regular posts + ${parsed.festivalPosts.length} festival posts generated*`;
-
-    // Build per-post action buttons from created calendar rows
-    const keyboardRows = [];
-    if (planId && createdCalendarIds.length > 0) {
-      for (let i = 0; i < sortedPosts.length; i++) {
-        const post = sortedPosts[i];
-        const calId = createdCalendarIds[i];
-        if (!calId) continue;
-        const shortTopic = post.topic.length > 30 ? post.topic.slice(0, 27) + '...' : post.topic;
-        monthActionMap.set(calId, planId);
-        keyboardRows.push([
-          { text: `✏️ ${shortTopic}`, callback_data: cb('me',calId) },
-          { text: `❌ Remove`, callback_data: cb('mr',calId) },
-          { text: `🔄 Replace`, callback_data: cb('mrp',calId) },
-        ]);
-      }
-      keyboardRows.push(
-        [{ text: '✅ Approve this month', callback_data: cb('ma',planId) }]
-      );
-    }
-
-    await bot.sendMessage(chatId, output, {
-      parse_mode: 'Markdown',
-      reply_markup: planId ? { inline_keyboard: keyboardRows } : undefined,
+    // Step e: 整体确认卡片(2026-08-07 换掉 36 个按钮那版,详见 lib/plan-summary.js)
+    const { buildPlanCard } = require('./lib/plan-summary');
+    const { text: cardText, keyboard: cardKeyboard } = buildPlanCard({
+      posts: parsed.posts,
+      picks: productPicks,
+      festivalPosts: parsed.festivalPosts,
+      monthLabel: targetMonthStr,
+      planId,
     });
+
+    // 刻意不传 parse_mode:标题里一个 _ 或 * 就会让整条消息 400,她什么都收不到。
+    await bot.sendMessage(chatId, cardText, { reply_markup: cardKeyboard });
 
   } catch (err) {
     console.error('/plan_month error:', err);
@@ -2032,141 +1936,26 @@ bot.on('callback_query', async (cb) => {
   }
 
   // me:calId — Edit topic/angle
-  if (data.startsWith('me:')) {
-    const calId = data.slice('me:'.length);
-    const planId = await resolvePlanId(monthActionMap, calId);
+  // 「💬 我有想法要调整」—— 2026-08-07 换掉逐篇的 me/mr/mrp 三个按钮。
+  //
+  // 那三个按钮删掉的理由:这一步她只有标题和角度(文案配图都还没生成),
+  // 没有足够信息做逐篇判断;而且"第3篇跟第7篇太像"用说的,比在 36 个按钮里
+  // 找准那一颗快得多 —— 自然语言那套本来就已经做好了。
+  if (data.startsWith('mt:')) {
+    const planId = data.slice('mt:'.length);
     try {
-      awaitingMonthEdits.set(chatId, { planId, postId: calId });
-      await bot.answerCallbackQuery(cb.id, { text: 'Send the new topic/angle' });
-      const originalText = (message && message.text) || '';
-      await bot.editMessageText(originalText + '\n\n✏️ Send the new topic/angle for this post:', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [] },
-      });
+      await bot.answerCallbackQuery(cb.id);
+      pendingPlanTweak.set(String(chatId), planId);
+      const { ADJUST_PROMPT } = require('./lib/plan-summary');
+      await bot.sendMessage(chatId, ADJUST_PROMPT);
+      mark.markNote(chatId, `[system note: the user opened "adjust the monthly plan" for plan ${planId}. Her next message is what she wants changed about the plan. Read the plan, work out whether it is a single-post change (swap one topic/angle/date) or a structural change (pillar mix, number of posts, remove festivals). For a structural change, tell her plainly that it means re-planning the whole month and ask her to confirm before you do it — never silently re-run it.]`);
     } catch (err) {
-      console.error('month_edit_topic callback error:', err);
-      try {
-        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed.' });
-      } catch (_) {}
+      console.error('mt error:', err);
     }
     return;
   }
 
-  // mr:postId — Remove post from plan
-  if (data.startsWith('mr:')) {
-    const postId = data.slice('mr:'.length);
-    const planId = await resolvePlanId(monthActionMap, postId);
-    try {
-      // Read the post for confirmation context
-      const row = await supabase.getContentCalendar(postId);
-      const topic = row ? row.topic || 'this post' : 'this post';
-      awaitingMonthRemoves.set(chatId, { planId, postId });
-      await bot.answerCallbackQuery(cb.id, { text: 'Confirm removal?' });
-      const originalText = (message && message.text) || '';
-      await bot.editMessageText(originalText + `\n\n❓ Remove *${topic}* from the plan? Reply "Yes" to confirm, "No" to cancel.`, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [] },
-      });
-    } catch (err) {
-      console.error('month_remove callback error:', err);
-      try {
-        await bot.answerCallbackQuery(cb.id, { text: 'Operation failed.' });
-      } catch (_) {}
-    }
-    return;
-  }
 
-  // mrp:calId — Regenerate a single post
-  if (data.startsWith('mrp:')) {
-    const calId = data.slice('mrp:'.length);
-    const planId = await resolvePlanId(monthActionMap, calId);
-    const postId = calId;
-    try {
-      await bot.answerCallbackQuery(cb.id, { text: 'Regenerating post...' });
-      const originalText = (message && message.text) || '';
-      await bot.editMessageText(originalText + '\n\n⏳ Regenerating this post...', {
-        chat_id: chatId,
-        message_id: messageId,
-        reply_markup: { inline_keyboard: [] },
-      });
-
-      // Read the current row
-      const row = await supabase.getContentCalendar(postId);
-      if (!row) {
-        await bot.sendMessage(chatId, '❌ Post not found.');
-        return;
-      }
-
-      // Read the plan for context
-      const plan = await supabasePlans.getContentPlan(planId);
-      const targetMonthStr = plan ? plan.month : 'this month';
-
-      // Call LLM to regenerate just this one post
-      const regeneratePrompt = `You are a social media content strategist for Fanz Sdn Bhd, a Malaysian ceiling fan brand.
-
-Generate a single social media post for ${targetMonthStr}.
-
-The current post needs a fresh topic and angle. Here's the context:
-- Current pillar: ${row.pillar || 'product'}
-- Current topic: ${row.topic || '(none)'}
-
-Requirements:
-- Return ONLY valid JSON (no markdown, no explanation)
-- Format: { "topic": "Catchy post title", "post_angle": "One-sentence angle explanation", "pillar": "${row.pillar || 'product'}", "suggested_date": "${row.suggested_date || ''}" }
-- The topic should be 5-12 words, catchy and engaging
-- The post_angle should explain the creative angle
-- Keep the same pillar: ${row.pillar || 'product'}
-- Keep the same suggested_date: ${row.suggested_date || ''}
-- Must mention Fanz brand identity (Malaysian ceiling fan brand, 10-year motor warranty, SIRIM certified, DC motor technology)`;
-
-      const messages = [
-        { role: 'system', content: regeneratePrompt },
-        { role: 'user', content: `Generate a fresh ${row.pillar || 'product'} post for Fanz.` },
-      ];
-
-      const rawResponse = await callOpenRouter(messages);
-
-      // Parse the response
-      let replaced;
-      try {
-        const cleaned = rawResponse.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
-        replaced = JSON.parse(cleaned);
-      } catch (e) {
-        const arrayMatch = rawResponse.match(/\{.*\}/s);
-        if (arrayMatch) {
-          try {
-            replaced = JSON.parse(arrayMatch[0]);
-          } catch (e2) {
-            throw new Error(`Failed to parse replacement JSON: ${e2.message}`);
-          }
-        } else {
-          throw new Error('No valid JSON in replacement response');
-        }
-      }
-
-      // Update the calendar row with new topic/angle
-      await supabase.updateContentCalendar(postId, {
-        topic: replaced.topic || replaced.title || '(new topic)',
-        post_angle: replaced.post_angle || replaced.angle || '',
-      });
-
-      await bot.sendMessage(chatId, `✅ Post regenerated: *${replaced.topic || '(new topic)'}*`, {
-        parse_mode: 'Markdown',
-      });
-      // Reshow the updated calendar
-      await reshowMonthCalendar(chatId, planId);
-    } catch (err) {
-      console.error('month_replace callback error:', err);
-      await bot.sendMessage(chatId, userMessage(err, 'Failed to regenerate post. Please try again.'));
-    }
-    return;
-  }
-
-  // publish_go:rowId — Publish content
   if (data.startsWith('publish_go:')) {
     const rowId = data.slice('publish_go:'.length);
     try {
@@ -2986,7 +2775,6 @@ module.exports = {
   sendImageReviewCard,
   sendTechnicalFailureNotice,
   triggerImageRegeneration,
-  monthActionMap,
   batchActionMap,
   // Mark（对话式营销经理）— 测试用
   runSinglePostFromDraft,
