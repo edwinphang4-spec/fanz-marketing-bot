@@ -968,10 +968,23 @@ async function batchGenerateContent(chatId, planId) {
         imageTexts: spec.image_texts || null,
       };
     });
-    const rep = checkMonthlyRepetition(qaRows);
+    // 跨月查重(2026-08-07):在此之前只查同一个 plan —— 上个月用过的标题/CTA
+    // 这个月再用一次,查重器一声不吭。历史行合并进来一起查,qa-content 本来就
+    // 只认"一批行",不关心它们来自哪个 plan。
+    let historyRows = [];
+    try {
+      const hist = require('./lib/content-history');
+      const recent = await hist.recentPosts();
+      const currentIds = new Set((finalRows || []).map((r) => r.id));
+      historyRows = hist.repetitionRows(recent.filter((r) => !currentIds.has(r.id)));
+    } catch (err) {
+      console.error('[qa-content] 跨月历史读取失败,只查本月:', err.message);
+    }
+    const scopeLabel = historyRows.length ? '近 90 天' : '整月';
+    const rep = checkMonthlyRepetition([...qaRows, ...historyRows], { scopeLabel });
     // 角度分布 + 品牌事实配额:前者查代码分配的结果,后者查模型有没有听话。
     const ang = checkAngleDistribution(qaRows);
-    const report = [formatRepetitionReport(rep), formatAngleReport(ang)].filter(Boolean).join('\n\n');
+    const report = [formatRepetitionReport(rep, 12, scopeLabel), formatAngleReport(ang)].filter(Boolean).join('\n\n');
     if (report) {
       console.warn(`[qa-content] plan ${planId}:\n${report}`);
       await bot.sendMessage(chatId, report);
